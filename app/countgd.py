@@ -137,8 +137,8 @@ class CountGDEngine:
                 prediction = self.model(target, exemplar, boxes, [], [], captions=[caption])
             else:
                 prediction = self.model.forward_conditioned(target, conditioning)
-            tokens = prediction["input_ids"][0]
-            positive_end = next((i for i, token in enumerate(tokens) if int(token) == 1012), None)
+            tokens = prediction["input_ids"][0].tolist()
+            positive_end = next((i for i, token in enumerate(tokens) if token == 1012), None)
             if positive_end is None:
                 raise RuntimeError("CountGD++ did not return a positive prompt separator.")
             logits = prediction["pred_logits"].sigmoid()[0]
@@ -146,9 +146,10 @@ class CountGDEngine:
             remaining = logits[:, positive_end + 1:]
             negative = remaining.amax(dim=-1) if remaining.shape[1] else torch.full_like(positive, -float("inf"))
             selected = (positive > confidence) & (positive > negative)
-            boxes = prediction["pred_boxes"][0][selected].cpu().numpy()
-            scores = logits[selected].amax(dim=-1).cpu().numpy()
-        return boxes, scores
+            # Transfer selected boxes and scores together to avoid a second CUDA sync.
+            packed = torch.cat((prediction["pred_boxes"][0], logits.amax(dim=-1, keepdim=True)), dim=-1)
+            selected_rows = packed[selected].cpu().numpy()
+        return selected_rows[:, :4], selected_rows[:, 4]
 
     def _reference_tensors(self, image: Image.Image, boxes: list[list[float]]):
         if round(1333 * min(image.size) / max(image.size)) < 1:

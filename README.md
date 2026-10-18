@@ -34,6 +34,8 @@ docker compose -f compose.yaml -f compose.gpu.yaml up --build -d
 
 This builds `yoloe-counter:cuda128` with CUDA 12.8 PyTorch and requests the GPU for both CountGD++ and YOLOE. Keep both Compose files in subsequent GPU deployment commands. The regular Compose command builds the smaller `yoloe-counter:local` CPU image; run it again with `--build` to switch back. Both use the same session volume. The selected GPU deployment survives container and Docker restarts.
 
+CountGD++ GPU optimization measurements, exact-output checks, reproduction commands, and rollback steps are recorded in [PERFORMANCE.md](PERFORMANCE.md).
+
 For later rebuilds from this NAS workspace, reuse the model files already in the GPU image to avoid transferring them again. The build still verifies every checkpoint, and the resulting image includes all assets:
 
 ```sh
