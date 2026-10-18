@@ -1,0 +1,1 @@
+"""Local object counting application."""

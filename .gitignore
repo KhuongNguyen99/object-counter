@@ -1,0 +1,12 @@
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+data/
+models/*
+!models/.gitkeep
+test-results/
+.codex-remote-attachments/
+node_modules/
+.env

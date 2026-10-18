@@ -1,0 +1,9 @@
+services:
+  counter:
+    image: yoloe-counter:cuda128
+    build:
+      args:
+        TORCH_INDEX_URL: https://download.pytorch.org/whl/cu128
+    gpus: all
+    environment:
+      DEVICE: "0"

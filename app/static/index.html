@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f6f8f7">
+  <title>Countwell · Object counting</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="site-header">
+    <div class="brand" aria-label="Countwell">
+      <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span><span></span></span>
+      <span>countwell<span class="brand-dot">.</span></span>
+    </div>
+    <span id="header-status" class="header-status">Ready to count</span>
+    <details class="help-menu">
+      <summary>Help</summary>
+      <div class="help-content">
+        <p>Draw boxes around examples of the same object in your references.</p>
+        <p>The Object description guides automatic reference boxes for every counting model. For CountGD++, it also guides the count.</p>
+        <p>Every photo adds to the total. Overlapping photos can count the same objects again.</p>
+        <p>Up to 8 references, 32 boxes, and 20 photos per batch. JPEG, PNG, or WebP, up to 20 MB and 30 megapixels each. HEIC works when your browser supports it.</p>
+      </div>
+    </details>
+  </header>
+
+  <main class="page-shell">
+    <div id="page-intro" class="page-intro">
+      <h1 id="setup-title">New count</h1>
+    </div>
+
+    <div id="notice" class="notice" role="alert" hidden></div>
+
+    <section id="setup-view" class="workspace-grid" aria-labelledby="setup-title">
+      <div class="workspace-main">
+        <section class="panel setup-panel" aria-label="Count settings">
+          <div class="field-grid">
+            <label class="field">Object
+              <input id="object-label" type="text" maxlength="80" placeholder="e.g. Red apples" autocomplete="off" required>
+            </label>
+            <label class="field">Model
+              <select id="model-select" aria-describedby="model-help"></select>
+              <span id="model-help" class="visually-hidden">Loading models…</span>
+            </label>
+          </div>
+          <details class="advanced"><summary>Options</summary>
+            <label class="field confidence-field">Minimum confidence <strong id="confidence-value">0.25</strong>
+              <input id="confidence" type="range" min="0.01" max="0.95" step="0.01" value="0.25">
+              <small>Higher values show fewer, more certain detections.</small>
+            </label>
+          </details>
+        </section>
+
+        <section class="panel reference-panel" aria-labelledby="reference-title">
+          <div class="panel-heading"><div><h2 id="reference-title">References</h2><p>Review suggested boxes or draw your own.</p></div><span id="reference-count" class="count-pill">0 / 8</span></div>
+          <div class="upload-actions">
+            <label class="upload-button primary-upload" for="reference-gallery"><span aria-hidden="true">＋</span> Choose photos</label>
+            <input id="reference-gallery" type="file" accept="image/*" multiple class="visually-hidden">
+            <label class="upload-button" for="reference-camera"><span aria-hidden="true">◉</span> Camera</label>
+            <input id="reference-camera" type="file" accept="image/*" capture="environment" class="visually-hidden">
+          </div>
+          <div id="reference-thumbs" class="thumb-list" aria-label="Reference photos"></div>
+          <div id="reference-editor" class="reference-editor" hidden>
+            <div class="editor-top"><div><strong id="editor-filename"></strong></div><button id="remove-reference" class="text-button danger" type="button">Remove</button></div>
+            <div id="drawing-surface" class="drawing-surface"><img id="editor-image" alt="Selected reference photo"><svg id="box-overlay" aria-label="Draw boxes on reference photo"></svg><div id="box-markers" class="box-markers" aria-hidden="true"></div></div>
+            <div class="editor-bottom"><span id="box-count">0 boxes</span><div class="editor-actions"><button id="auto-detect-boxes" class="text-button" type="button">Auto-detect</button><button id="undo-box" class="text-button" type="button">Undo</button></div></div>
+            <div id="box-list" class="box-list" aria-label="Reference boxes"></div>
+            <details class="coordinate-entry"><summary>Coordinates</summary><p id="coordinate-help">Pixel coordinates</p><form id="coordinate-form"><div class="coordinate-grid"><label>Left (x1)<input id="box-x1" type="number" min="0" step="1" required></label><label>Top (y1)<input id="box-y1" type="number" min="0" step="1" required></label><label>Right (x2)<input id="box-x2" type="number" min="1" step="1" required></label><label>Bottom (y2)<input id="box-y2" type="number" min="1" step="1" required></label></div><button id="add-coordinate-box" class="secondary-button" type="submit">Add box</button></form></details>
+          </div>
+        </section>
+      </div>
+
+      <aside class="workspace-side">
+        <section class="panel target-panel" aria-labelledby="target-title">
+          <div class="panel-heading"><h2 id="target-title">Photos to count</h2><span id="target-count" class="count-pill" aria-live="polite">0 / 20</span></div>
+          <div class="upload-actions vertical">
+            <label class="upload-button primary-upload" for="target-gallery">＋ Choose photos</label>
+            <input id="target-gallery" type="file" accept="image/*" multiple class="visually-hidden">
+            <label class="upload-button" for="target-camera">◉ Camera</label>
+            <input id="target-camera" type="file" accept="image/*" capture="environment" class="visually-hidden">
+          </div>
+          <div id="target-queue" class="target-queue" aria-label="Photos ready to count"></div>
+          <button id="start-button" class="action-button" type="button">Start counting <span aria-hidden="true">→</span></button>
+          <p class="quiet-note">Overlapping photos count objects again.</p>
+        </section>
+      </aside>
+    </section>
+
+    <section id="session-view" hidden aria-labelledby="session-title">
+      <div class="session-heading"><div><h2 id="session-title">Your count</h2><p id="session-subtitle"></p></div><div class="session-actions"><a id="export-link" class="secondary-button" href="#">Export CSV</a><button id="new-count-button" class="secondary-button" type="button" hidden>New count</button></div></div>
+      <div class="metric-grid" aria-label="Count summary"><div class="metric primary-metric"><span>Total objects</span><strong id="metric-total">0</strong><small id="metric-status">Counting in progress</small></div><div class="metric"><span>Latest batch</span><strong id="metric-latest">—</strong><small id="metric-latest-note">No batch yet</small></div><div class="metric"><span>Photos counted</span><strong id="metric-images">0</strong><small id="metric-batches">0 batches</small></div></div>
+      <div class="results-grid"><div class="results-main"><div class="results-title"><h3>Results</h3><span id="results-state" class="state-pill">Ready</span></div><div id="batch-list" class="batch-list"></div></div>
+        <aside id="next-batch-panel" class="panel next-batch-panel">
+          <div class="panel-heading"><h2>Next batch</h2><span id="next-count" class="count-pill" aria-live="polite">0 / 20</span></div>
+          <div class="upload-actions vertical"><label class="upload-button primary-upload" for="next-gallery">＋ Choose photos</label><input id="next-gallery" type="file" accept="image/*" multiple class="visually-hidden"><label class="upload-button" for="next-camera">◉ Camera</label><input id="next-camera" type="file" accept="image/*" capture="environment" class="visually-hidden"></div>
+          <div id="next-queue" class="target-queue" aria-label="Next batch photos"></div>
+          <button id="upload-button" class="action-button" type="button">Count this batch <span aria-hidden="true">→</span></button>
+          <p class="quiet-note">Overlapping photos count objects again.</p>
+          <div class="finish-divider"></div><button id="finish-button" class="text-button finish-button" type="button">Finish count <span aria-hidden="true">✓</span></button>
+        </aside>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="image-dialog" class="image-dialog" aria-label="Enlarged result image"><div class="dialog-heading"><strong id="dialog-title"></strong><button id="close-dialog" type="button" aria-label="Close image">×</button></div><img id="dialog-image" alt="Enlarged annotated result image"></dialog>
+</body>
+</html>
