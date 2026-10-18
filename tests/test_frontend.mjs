@@ -190,6 +190,36 @@ test("model selection applies each model's default confidence", async () => {
   assert.equal(app.get("confidence-value").textContent, "0.25");
 });
 
+test("text-only counting hides references and omits existing reference uploads", async () => {
+  const models = { models: [...catalog.models,
+    { id: "sam3count", name: "SAM3Count", available: true, reference_mode: "none", default_confidence: .3 }],
+    default_model: "sam3count" };
+  let submitted;
+  const app = browser(async (path, options) => {
+    if (path === "/api/sessions") {
+      submitted = options.body.items;
+      return response({ ...session(), model: "sam3count" }, 201);
+    }
+    if (path.endsWith("/batches")) return response({ id: "batch-1" }, 202);
+    return response({ ...session(), model: "sam3count" });
+  }, null, models);
+  await settle();
+  assert.equal(app.get("reference-panel").hidden, true);
+  assert.equal(app.get("text-prompt-note").hidden, false);
+  app.state.refs.push({ file: { name: "old-reference.jpg" }, url: "blob:ref", boxes: [] });
+  app.state.targets.push({ file: { name: "rings.jpg" }, url: "blob:ring" });
+  app.get("object-label").value = "white rings";
+  await app.get("start-button").listeners.click();
+  assert.ok(submitted, "text-only count must start without boxed references");
+  assert.equal(submitted.some(([key]) => key === "references"), false);
+  assert.equal(submitted.find(([key]) => key === "reference_boxes")[1], "[]");
+  app.state.session = null;
+  app.get("model-select").value = "yoloe-26s-seg";
+  app.get("model-select").listeners.change();
+  assert.equal(app.get("reference-panel").hidden, false);
+  assert.equal(app.get("text-prompt-note").hidden, true);
+});
+
 test("zero detections are flagged for review, including results saved before warnings existed", async () => {
   const app = browser(async () => response(session()));
   await settle();

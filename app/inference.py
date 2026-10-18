@@ -11,7 +11,8 @@ from uuid import uuid4
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-from .models import COUNTGD_MODEL_ID, PETDINO_MODEL_ID, checkpoint_path, countgd_dir, petdino_dir, validate_checkpoint
+from .models import (COUNTGD_MODEL_ID, PETDINO_MODEL_ID, SAM3COUNT_MODEL_ID, checkpoint_path,
+                     countgd_dir, petdino_dir, sam3count_dir, validate_checkpoint)
 from .tiling import make_tiles, merge_tile_detections
 
 
@@ -151,13 +152,26 @@ class InferenceEngine:
         """
         if not math.isfinite(confidence) or not 0 <= confidence <= 1:
             raise ValueError("Confidence must be between 0 and 1.")
-        if not references or not image_paths:
+        if not image_paths or (not references and model_id != SAM3COUNT_MODEL_ID):
             raise ValueError("Provide reference boxes and at least one image to count.")
+        if model_id == SAM3COUNT_MODEL_ID and (references or not label.strip()):
+            raise ValueError("SAM3Count requires an Object description and no reference photos.")
         directory = Path(output_dir).resolve()
         directory.mkdir(parents=True, exist_ok=True)
         with self._lock:
             import torch
             device = self._device()
+            if model_id == SAM3COUNT_MODEL_ID:
+                if self._model_id != SAM3COUNT_MODEL_ID or self._model is None:
+                    from .sam3count import Sam3CountEngine
+                    self._unload_model()
+                    self._model = Sam3CountEngine(sam3count_dir(), f"cuda:{device}" if device.isdigit() else device)
+                    self._model_id = SAM3COUNT_MODEL_ID
+                try:
+                    return self._model.count(references, image_paths, str(directory), confidence, label)
+                except Exception:
+                    self._unload_model()
+                    raise
             if model_id == COUNTGD_MODEL_ID:
                 return self._load_countgd_model(device).count(
                     references, image_paths, str(directory), confidence, label)

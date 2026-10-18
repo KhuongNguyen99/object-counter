@@ -1,0 +1,6 @@
+# SAM 3 imports these in addition to the application's existing Torch, timm, and image stack.
+ftfy==6.1.1
+iopath==0.1.10
+einops==0.8.1
+# Torch's CPU wheel does not provide Triton, but SAM 3 imports it unconditionally.
+triton==3.5.1

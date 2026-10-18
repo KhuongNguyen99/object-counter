@@ -20,7 +20,7 @@
       <summary>Help</summary>
       <div class="help-content">
         <p>Draw boxes around examples of the same object in your references.</p>
-        <p>The Object description guides automatic reference boxes for every counting model. For CountGD++, it also guides the count.</p>
+        <p>The Object description guides automatic reference boxes and CountGD++ counts. SAM3Count uses only this description.</p>
         <p>Every photo adds to the total. Overlapping photos can count the same objects again.</p>
         <p>Up to 8 references, 32 boxes, and 20 photos per batch. JPEG, PNG, or WebP, up to 20 MB and 30 megapixels each. HEIC works when your browser supports it.</p>
       </div>
@@ -46,6 +46,7 @@
               <span id="model-help" class="visually-hidden">Loading models…</span>
             </label>
           </div>
+          <p id="text-prompt-note" class="quiet-note" hidden>Uses the Object description; no reference photos.</p>
           <details class="advanced"><summary>Options</summary>
             <label class="field confidence-field">Minimum confidence <strong id="confidence-value">0.25</strong>
               <input id="confidence" type="range" min="0.01" max="0.95" step="0.01" value="0.25">
@@ -54,7 +55,7 @@
           </details>
         </section>
 
-        <section class="panel reference-panel" aria-labelledby="reference-title">
+        <section id="reference-panel" class="panel reference-panel" aria-labelledby="reference-title">
           <div class="panel-heading"><div><h2 id="reference-title">References</h2><p>Review suggested boxes or draw your own.</p></div><span id="reference-count" class="count-pill">0 / 8</span></div>
           <div class="upload-actions">
             <label class="upload-button primary-upload" for="reference-gallery"><span aria-hidden="true">＋</span> Choose photos</label>

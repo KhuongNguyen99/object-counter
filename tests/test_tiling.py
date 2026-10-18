@@ -219,6 +219,21 @@ def test_single_tile_preserves_same_tile_duplicates_without_mutating_inputs():
     assert all("index" not in record for record in records)
 
 
+def test_source_members_are_returned_only_when_requested():
+    tiles = make_tiles(1000, 800, 800)
+    records = predictions(tiles, [[700, 200, 900, 400]])
+    for tile, items in records:
+        for item in items:
+            item["source"] = tile.index
+    ordinary = merge_tile_detections(records, 1000, 800)
+    detailed = merge_tile_detections(records, 1000, 800, include_members=True)
+    assert len(ordinary) == len(detailed) == 1
+    assert "members" not in ordinary[0]
+    assert {item["source"] for item in detailed[0]["members"]} == {0, 1}
+    assert {key: value for key, value in detailed[0].items() if key != "members"} == ordinary[0]
+    assert all("members" not in item for _, items in records for item in items)
+
+
 def test_bad_coordinates_do_not_create_spurious_detections():
     tile = Tile(0, (0, 0, 100, 50), (0, 0, 100, 50))
     records = [{"box": box, "confidence": .8} for box in

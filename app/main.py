@@ -370,19 +370,22 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None):
 
     @app.post("/api/sessions", status_code=201)
     async def create_session(
-        references: list[UploadFile] = File(...), label: str = Form(...),
+        label: str = Form(...), references: list[UploadFile] = File(default=[]),
         model: str = Form(...), confidence: float = Form(.25),
-        reference_boxes: str = Form(...),
+        reference_boxes: str = Form("[]"),
     ):
         label = _validate_label(label)
         if not math.isfinite(confidence) or not .01 <= confidence <= .95:
             raise HTTPException(422, "Confidence must be between 0.01 and 0.95")
-        if not 1 <= len(references) <= MAX_REFERENCES:
-            raise HTTPException(422, "Upload 1–8 reference images")
-        available = {entry["id"] for entry in _model_catalog(model_lister, detect_device)["models"]
+        available = {entry["id"]: entry for entry in _model_catalog(model_lister, detect_device)["models"]
                      if entry.get("available")}
         if model not in available:
             raise HTTPException(422, "Choose an available model")
+        if available[model].get("reference_mode") == "none":
+            if references:
+                raise HTTPException(422, "This model uses the Object description; do not upload reference images")
+        elif not 1 <= len(references) <= MAX_REFERENCES:
+            raise HTTPException(422, "Upload 1–8 reference images")
         session_id = _id()
         files_dir = data_dir / session_id / "files"
         files_dir.mkdir(parents=True)

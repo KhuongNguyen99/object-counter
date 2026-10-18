@@ -72,6 +72,8 @@
     const confidence = selected?.default_confidence ?? 0.25;
     $("confidence").value = String(confidence);
     $("confidence-value").textContent = Number(confidence).toFixed(2);
+    $("reference-panel").hidden = selected?.reference_mode === "none";
+    $("text-prompt-note").hidden = selected?.reference_mode !== "none";
   }
 
   async function loadModels() {
@@ -549,16 +551,18 @@
     const label = $("object-label").value.trim();
     if (!label) { message("Name the object you want to count."); $("object-label").focus(); return; }
     if (!state.models.some((model) => model.id === $("model-select").value && model.available)) { message("Choose an available model."); return; }
-    if (!state.refs.length) { message("Add at least one reference photo and draw a box around the object."); return; }
-    const missing = state.refs.findIndex((ref) => !ref.boxes.length);
+    const usesReferences = state.models.find((model) => model.id === $("model-select").value)?.reference_mode !== "none";
+    if (usesReferences && !state.refs.length) { message("Add at least one reference photo and draw a box around the object."); return; }
+    const refs = usesReferences ? state.refs : [];
+    const missing = refs.findIndex((ref) => !ref.boxes.length);
     if (missing >= 0) { state.selected = missing; renderReferences(); message(`Draw a box on reference photo ${missing + 1} before starting.`); return; }
     if (!state.targets.length) { message("Add at least one photo to your first batch."); return; }
     const form = new FormData();
     form.append("label", label);
     form.append("model", $("model-select").value);
     form.append("confidence", $("confidence").value);
-    form.append("reference_boxes", JSON.stringify(state.refs.map((ref) => ref.boxes)));
-    for (const ref of state.refs) form.append("references", ref.file);
+    form.append("reference_boxes", JSON.stringify(refs.map((ref) => ref.boxes)));
+    for (const ref of refs) form.append("references", ref.file);
     state.busy = true;
     render();
     message("");

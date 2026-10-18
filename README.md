@@ -1,8 +1,10 @@
 # Reference Object Counter
 
-A phone-friendly counting app with a FastAPI backend and a lightweight browser UI, shipped together in one Docker image. **CountGD++ (experimental)** is the default, alongside all five **YOLOE-26** visual-prompt models (Nano, Small, Medium, Large, Extra Large). All weights, the CountGD++ source, and its BERT encoder are included. No cloud inference, API key, or runtime model download is needed.
+A phone-friendly counting app with a FastAPI backend and a lightweight browser UI, shipped together in one Docker image. **CountGD++ (experimental)** is the default, alongside **SAM3Count-FT**, **PET-DINO Swin-T**, and all five **YOLOE-26** visual-prompt models (Nano, Small, Medium, Large, Extra Large). Weights and inference dependencies are bundled for offline counting. No cloud inference, API key, or runtime model download is needed.
 
 ## Run
+
+Before the first build, put the approved [Meta `sam3.pt`](https://huggingface.co/facebook/sam3/blob/main/sam3.pt) and the [SAM3Count authors' `sam3_ft.pt`](https://drive.google.com/file/d/1uSpEeM9l9SN_Q_W-CJqYy75mQ-O75HpL/view) in `models/sam3count/`. Meta requires approved access before downloading its checkpoint. Docker verifies both pinned files and bundles them; credentials are not needed for inference. The other model weights are downloaded during the build when missing.
 
 ```sh
 docker compose up --build -d
@@ -36,17 +38,17 @@ This builds `yoloe-counter:cuda128` with CUDA 12.8 PyTorch and requests the GPU 
 
 CountGD++ GPU optimization measurements, exact-output checks, reproduction commands, and rollback steps are recorded in [PERFORMANCE.md](PERFORMANCE.md).
 
-For later rebuilds from this NAS workspace, reuse the model files already in the GPU image to avoid transferring them again. The build still verifies every checkpoint, and the resulting image includes all assets:
+For later application-code-only rebuilds from this NAS workspace, reuse the dependencies and model files already in the GPU image. The build still verifies every checkpoint, and the resulting image includes all assets. Omit these context overrides when changing dependencies or bundled upstream source versions:
 
 ```sh
-docker build --build-context model-assets=docker-image://yoloe-counter:cuda128 --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128 -t yoloe-counter:cuda128 .
+docker build --build-context sam3count-dependencies=docker-image://yoloe-counter:cuda128 --build-context model-assets=docker-image://yoloe-counter:cuda128 --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128 -t yoloe-counter:cuda128 .
 docker compose -f compose.yaml -f compose.gpu.yaml up --no-build -d
 ```
 
 ## Count objects
 
 1. Describe the object and choose a model. For CountGD++, the Object field is also a text prompt: use a description such as **white plastic ring**. CountGD++ is the default trial model. YOLOE uses the visual references; its Nano variant favors speed, while larger sizes use more memory and compute.
-2. Add one or more reference photos. The Object description guides automatic boxes around examples of the **same kind of object**. Review the numbered boxes, remove unwanted ones, or draw a box manually. If you add photos before entering a description, enter it and choose **Auto-detect**. References guide detection; they do not train the model or add to the total.
+2. For reference-guided models, add one or more reference photos. The Object description guides automatic boxes around examples of the **same kind of object**. Review the numbered boxes, remove unwanted ones, or draw a box manually. If you add photos before entering a description, enter it and choose **Auto-detect**. References guide detection; they do not train the model or add to the total. **SAM3Count-FT uses the description alone**, so its reference controls are hidden.
 3. Take a photo or select one or more counting photos, then start counting.
 4. Review the numbered annotations and count on **each image**, the batch subtotal, and the session's running total. Detection details include the confidence of each numbered object. Zero detections are flagged **Review needed**; they do not prove that no objects are present.
 5. Add the next photos to accumulate another batch using the same references and model. Choose **Finish counting** when done, then start a new count for another object. A CSV export preserves the image and batch breakdown.
@@ -59,7 +61,15 @@ Use clear reference examples at a similar scale and viewpoint to your targets. A
 
 **PET-DINO Swin-T (experimental)** is an additional reference-guided detector. Its official checkpoint and source are bundled for offline use. Boxed examples from separate reference photos are encoded once per batch and combined using the upstream visual-embedding workflow. It returns bounding boxes for counting; it does not produce segmentation masks. Photos that would lose resolution use native 800-pixel crops and the existing cross-tile reconciliation. Review the numbered detections before accepting a count; this model is an alternative to evaluate, not a guaranteed accuracy upgrade.
 
-PET-DINO's MMDetection/MMCV dependencies run in a separate bundled Python environment inside the same container. Switching models closes that worker before loading another model, preserving the single inference queue. CountGD++ remains the default and continues to suggest editable reference boxes for every counting model. No additional UI steps or external inference service are required.
+PET-DINO's MMDetection/MMCV dependencies run in a separate bundled Python environment inside the same container. Switching models closes that worker before loading another model, preserving the single inference queue. CountGD++ remains the default and continues to suggest editable reference boxes for reference-guided models. No external inference service is required.
+
+**SAM3Count-FT (experimental)** uses the [SAM3Count authors' public dense-counting checkpoint](https://github.com/Joan947/SAM3Count), built on Meta SAM 3. It accepts a text description, with no separate reference images. The app uses the upstream density decisions, adaptive crop grid, and box/mask duplicate suppression with the presence score disabled. Each surviving mask instance contributes one count; the UI displays numbered bounding boxes. Masks are held only while reconciling detections.
+
+The app adds a native-resolution safeguard: images larger than SAM 3's 1008-pixel input receive full overlapping crop coverage even when the coarse pass finds few objects. Coarse detections guide crop size but are excluded from the final count when those crops replace the full-image pass. Crop fragments use the app's shared association before duplicate suppression, so partial observations can be reconciled before evidence is discarded. Compact masks preserve the upstream mask-intersection calculation without allocating a full 4K mask for every object. Duplicate suppression can still make mistakes on touching or occluded objects; review the numbered results.
+
+This integration loads the approved Meta base checkpoint and overlays the authors' fine-tuned weights, retaining the base segmentation head that is absent from the fine-tuned file. It currently requires an NVIDIA CUDA GPU; CPU deployments keep the option unavailable. Other counting models retain CPU support. Both official source revisions and checkpoint bytes are pinned and verified before loading. SAM3Count code is MIT-licensed; the underlying SAM materials retain the [SAM License](https://github.com/facebookresearch/sam3/blob/main/LICENSE). Copies of both licenses are retained with their source inside the image at `/opt/sam3count/LICENSE` and `/opt/sam3/LICENSE`.
+
+To reproduce the private-photo comparison after making the original fixtures available, run `python scripts/compare_counting_models.py --check-inputs`, then `python scripts/compare_counting_models.py --output-dir test-results/sam3count-comparison`. It compares identical target bytes and text, records CountGD++'s additional reference prompt, and checks ring detections against ground truth only when image hashes match. It produces a side-by-side `comparison.html` and machine-readable `comparison.json`. Totals without a verified ground truth are observations, not accuracy scores.
 
 The [official YOLOE documentation](https://docs.ultralytics.com/models/yoloe/) describes the visual-prompt models used here:
 

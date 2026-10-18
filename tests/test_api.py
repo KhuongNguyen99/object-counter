@@ -114,6 +114,25 @@ def settled(client, session_id, batch_id):
     raise AssertionError("batch did not finish")
 
 
+def test_text_only_model_counts_without_references_and_rejects_ignored_uploads(tmp_path):
+    engine = FakeEngine()
+    models = MODELS + [{"id": "sam3count", "available": True, "reference_mode": "none"}]
+    with TestClient(create_app(tmp_path, lambda: engine, lambda: models)) as client:
+        data = {"label": "white rings", "model": "sam3count"}
+        created = client.post("/api/sessions", data=data)
+        assert created.status_code == 201
+        session_id = created.json()["id"]
+        assert created.json()["references"] == []
+        batch = new_batch(client, session_id, ("rings.png", png("white")))
+        saved, result = settled(client, session_id, batch.json()["id"])
+        assert result["status"] == "complete" and saved["total_count"] == 1
+        assert engine.calls[0][1] == [] and engine.labels == ["white rings"]
+        assert client.post("/api/sessions", data=data,
+                           files=[("references", upload("ref.png", png("red")))]).status_code == 422
+        assert client.post("/api/sessions", data={**data, "reference_boxes": "[[[0,0,1,1]]]"}).status_code == 422
+        assert client.post("/api/sessions", data={**data, "model": "yoloe-26s-seg"}).status_code == 422
+
+
 def test_reference_boxes_normalizes_exif_and_cleans_temp_file(tmp_path):
     engine = FakeEngine()
     app = create_app(tmp_path, engine_factory=lambda: engine, model_lister=lambda: MODELS)

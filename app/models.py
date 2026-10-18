@@ -19,6 +19,12 @@ MODEL_FILENAMES = tuple(MODEL_ASSETS)
 SIZE_NAMES = {"n": "Nano", "s": "Small", "m": "Medium", "l": "Large", "x": "Extra large"}
 COUNTGD_MODEL_ID = "countgd-plusplus"
 PETDINO_MODEL_ID = "pet-dino-swin-t"
+SAM3COUNT_MODEL_ID = "sam3count"
+# Approved official Meta base and the SAM3Count authors' public dense-counting overlay.
+SAM3COUNT_ASSETS = {
+    "sam3.pt": (3450062241, "9999e2341ceef5e136daa386eecb55cb414446a00ac2b55eb2dfd2f7c3cf8c9e"),
+    "sam3_ft.pt": (3606641522, "9c2383bab0584e1f0600b45da294434f573644566c7c615b2998338286b98615"),
+}
 # Official fuweifu/PET-DINO checkpoint at a8d8cddbe752bbcc3df299b2fe56d0aa67a26776.
 PETDINO_ASSETS = {
     "pet_dino_swin-t_8xb4_12e_obj365.pth": (
@@ -46,6 +52,23 @@ def countgd_dir() -> Path:
 
 def petdino_dir() -> Path:
     return model_dir() / "petdino"
+
+
+def sam3count_dir() -> Path:
+    return model_dir() / "sam3count"
+
+
+def validate_sam3count_assets(directory: Path | None = None) -> None:
+    directory = directory or sam3count_dir()
+    for name, (size, digest) in SAM3COUNT_ASSETS.items():
+        path = directory / name
+        if not path.is_file():
+            raise FileNotFoundError(f"SAM3Count asset {name} is missing. Prepare the approved checkpoints first.")
+        if path.stat().st_size != size:
+            raise ValueError(f"SAM3Count asset {name} is incomplete or invalid.")
+        with path.open("rb") as stream:
+            if hashlib.file_digest(stream, "sha256").hexdigest() != digest:
+                raise ValueError(f"SAM3Count asset {name} failed SHA-256 validation.")
 
 
 def validate_petdino_assets(directory: Path | None = None) -> None:
@@ -136,5 +159,22 @@ def list_models() -> list[dict]:
                      all((countgd_dir() / name).is_file() and (countgd_dir() / name).stat().st_size == size
                          for name, (size, _) in COUNTGD_ASSETS.items() if name.startswith("bert-base-uncased/")),
         "bytes": sum(path.stat().st_size for path in pet_paths if path.is_file()),
+    })
+    sam_paths = [sam3count_dir() / name for name in SAM3COUNT_ASSETS]
+    sam_source = Path(os.environ.get("SAM3_SOURCE_DIR", "/opt/sam3"))
+    sam_count_source = Path(os.environ.get("SAM3COUNT_SOURCE_DIR", "/opt/sam3count"))
+    sam_ready = ((sam_source / "sam3/model_builder.py").is_file() and
+                 (sam_source / "sam3/assets/bpe_simple_vocab_16e6.txt.gz").is_file() and
+                 (sam_count_source / "sam3count_images.py").is_file() and
+                 all(path.is_file() and path.stat().st_size == size
+                     for path, (size, _) in zip(sam_paths, SAM3COUNT_ASSETS.values())))
+    if sam_ready:
+        import torch
+        sam_ready = os.environ.get("DEVICE", "auto") != "cpu" and torch.cuda.is_available()
+    result.insert(1, {
+        "id": SAM3COUNT_MODEL_ID, "name": "SAM3Count-FT (experimental)",
+        "family": "SAM3Count", "size": "base", "default_confidence": .35,
+        "reference_mode": "none", "requires_gpu": True, "available": sam_ready,
+        "bytes": sum(path.stat().st_size for path in sam_paths if path.is_file()),
     })
     return result

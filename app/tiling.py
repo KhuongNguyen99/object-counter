@@ -160,7 +160,7 @@ def _cells(box: Box, side: int):
 
 
 def merge_tile_detections(predictions: Iterable[tuple[Tile, list[dict]]],
-                          width: int, height: int) -> list[dict]:
+                          width: int, height: int, *, include_members: bool = False) -> list[dict]:
     """Map tile-local ``box``/``confidence`` records to sorted frame detections.
 
     Ordinary duplicate boxes need IoU >= .55. Partial crop-edge boxes must agree
@@ -175,6 +175,7 @@ def merge_tile_detections(predictions: Iterable[tuple[Tile, list[dict]]],
     Invalid/nonfinite or zero-area predictions are discarded, and boxes are
     clipped to their source crop before offsetting. Other record fields survive
     from the chosen representative; ``index`` is rebuilt in reading order.
+    ``include_members`` additionally returns source records for mask union.
     """
     detections: list[_Detection] = []
     by_tile: dict[int, list[int]] = {}
@@ -291,6 +292,8 @@ def merge_tile_detections(predictions: Iterable[tuple[Tile, list[dict]]],
             box = (min(detections[i].box[0] for i in group), min(detections[i].box[1] for i in group),
                    max(detections[i].box[2] for i in group), max(detections[i].box[3] for i in group))
         result.append({**detection.record, "box": list(box)})
+        if include_members:
+            result[-1]["members"] = [detections[i].record for i in group]
     result.sort(key=lambda record: (record["box"][1], record["box"][0]))
     for index, record in enumerate(result, 1):
         record["index"] = index

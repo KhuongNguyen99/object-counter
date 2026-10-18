@@ -54,9 +54,19 @@ RUN python /tmp/prepare_petdino.py --source-only \
     && /opt/petdino-venv/bin/pip install --no-deps --no-build-isolation -e /opt/petdino \
     && /opt/petdino-venv/bin/python -c "import mmdet; from mmcv.ops import MultiScaleDeformableAttention, roi_align"
 
+FROM petdino-dependencies AS sam3count-dependencies
+USER root
+ENV SAM3_SOURCE_DIR=/opt/sam3 \
+    SAM3COUNT_SOURCE_DIR=/opt/sam3count
+COPY requirements-sam3count.txt /tmp/requirements-sam3count.txt
+RUN pip install -r /tmp/requirements-sam3count.txt
+COPY scripts/prepare_sam3count.py /tmp/prepare_sam3count.py
+RUN python /tmp/prepare_sam3count.py --source-only \
+    && PYTHONPATH=/opt/sam3 python -c "from sam3.model_builder import build_sam3_image_model"
+
 FROM scratch AS model-assets
 COPY models /app/models
-FROM petdino-dependencies AS runtime
+FROM sam3count-dependencies AS runtime
 ENTRYPOINT []
 ENV PETDINO_SOURCE_DIR=/opt/petdino \
     PETDINO_PYTHON=/opt/petdino-venv/bin/python
@@ -67,6 +77,7 @@ COPY --from=model-assets /app/models /app/models
 RUN python scripts/download_models.py --model-dir /app/models \
     && HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 python scripts/prepare_countgd.py \
     && python scripts/prepare_petdino.py --assets-only \
+    && python scripts/prepare_sam3count.py --verify-only \
     && mkdir -p /app/data && chown -R counter:counter /app/data
 USER counter
 EXPOSE 8080
