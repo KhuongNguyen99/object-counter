@@ -57,6 +57,10 @@ Use clear reference examples at a similar scale and viewpoint to your targets. A
 
 ## Models and downloads
 
+**PET-DINO Swin-T (experimental)** is an additional reference-guided detector. Its official checkpoint and source are bundled for offline use. Boxed examples from separate reference photos are encoded once per batch and combined using the upstream visual-embedding workflow. It returns bounding boxes for counting; it does not produce segmentation masks. Photos that would lose resolution use native 800-pixel crops and the existing cross-tile reconciliation. Review the numbered detections before accepting a count; this model is an alternative to evaluate, not a guaranteed accuracy upgrade.
+
+PET-DINO's MMDetection/MMCV dependencies run in a separate bundled Python environment inside the same container. Switching models closes that worker before loading another model, preserving the single inference queue. CountGD++ remains the default and continues to suggest editable reference boxes for every counting model. No additional UI steps or external inference service are required.
+
 The [official YOLOE documentation](https://docs.ultralytics.com/models/yoloe/) describes the visual-prompt models used here:
 
 | Size | Included checkpoint |
@@ -73,11 +77,15 @@ The downloader verifies official checkpoint checksums. To populate `models/` bef
 
 ```sh
 python scripts/download_models.py --model-dir models
+python scripts/prepare_countgd.py --source-dir .vendor/countgd
+python scripts/prepare_petdino.py --assets-only
 ```
+
+The PET-DINO checkpoint is pinned to the [authors' release](https://huggingface.co/fuweifu/PET-DINO/tree/a8d8cddbe752bbcc3df299b2fe56d0aa67a26776), with size and SHA-256 checked before deserialization. Its [source](https://github.com/fuweifuvtoo/PET_DINO) is pinned to `7830a462f9a320f34293cce0aabdda1256d9dc15` under `/opt/petdino`, with its license retained. The build downloads missing assets and prepares the isolated runtime; subsequent inference runs offline. PET-DINO shares the already bundled BERT files with CountGD++.
 
 YOLOE visual references are encoded and combined into one target class. CountGD++ uses the object description and boxed references; examples from multiple reference photos are arranged into one contact sheet. Extra references can change both misses and false detections, so inspect the annotations. The runtime loads one selected model at a time and serializes inference to avoid GPU memory contention and prompt state mixing between sessions. CountGD++ uses its bundled offline BERT encoder. It prepares the reference image, reference features, and text features once per counting batch, then reuses them across its tiles and images. Each tile receives fresh text state for image/text fusion; a new batch prepares new conditioning. This cache works on CPU and GPU without changing resolution, overlap, confidence, or model precision.
 
-Automatic reference boxes use the bundled CountGD++ detector in text-only mode, independently of the model selected for counting. Its proposed boxes use original-photo coordinates and become ordinary editable references for either family. Nested part proposals are suppressed in favor of a complete enclosing object; edge-clipped and near-full-frame proposals are excluded. This is a suggestion step, and the description may match the wrong object or miss an unfamiliar one. The minimum-confidence slider controls counting, while reference suggestions use 0.23. Empty results leave the photo available for manual drawing. Temporary proposal uploads are removed when processing finishes; accepted reference images are saved only when the count is created. Reference detection shares the single worker and CountGD++ cache with counting, and requires no additional model download or service.
+Automatic reference boxes use the bundled CountGD++ detector in text-only mode, independently of the model selected for counting. Its proposed boxes use original-photo coordinates and become ordinary editable references for every counting model. Nested part proposals are suppressed in favor of a complete enclosing object; edge-clipped and near-full-frame proposals are excluded. This is a suggestion step, and the description may match the wrong object or miss an unfamiliar one. The minimum-confidence slider controls counting, while reference suggestions use 0.23. Empty results leave the photo available for manual drawing. Temporary proposal uploads are removed when processing finishes; accepted reference images are saved only when the count is created. Reference detection shares the single worker and CountGD++ cache with counting, and requires no additional model download or service.
 
 Large photos are automatically counted in overlapping crops whenever the selected model would otherwise reduce the source resolution. YOLOE uses crops up to its configured input size (640×640 by default); CountGD++ uses up to 800×800. Crops use the original pixels with at least 20% overlap. Neighboring detections are translated into the original photo's coordinates and reconciled before the final count; tile subtotals are not added directly. The result shows one full-resolution annotated photo, a tile count, and merge information inside Details. Larger photos take longer. This handles repeated views caused by tiling; the model can still miss objects or produce incorrect detections. Overlapping photos in separate uploads remain additive.
 

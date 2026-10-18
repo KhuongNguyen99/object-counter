@@ -11,7 +11,7 @@ from uuid import uuid4
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-from .models import COUNTGD_MODEL_ID, checkpoint_path, countgd_dir, validate_checkpoint
+from .models import COUNTGD_MODEL_ID, PETDINO_MODEL_ID, checkpoint_path, countgd_dir, petdino_dir, validate_checkpoint
 from .tiling import make_tiles, merge_tile_detections
 
 
@@ -84,12 +84,18 @@ class InferenceEngine:
         return device.split(":", 1)[1] if device.startswith("cuda:") else device
 
     def _unload_model(self):
+        if self._model is not None and hasattr(self._model, "close"):
+            self._model.close()
         self._model = None
         self._model_id = None
         gc.collect()
         import torch
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    def close(self):
+        with self._lock:
+            self._unload_model()
 
     def _load_countgd_model(self, device):
         if self._model_id != COUNTGD_MODEL_ID or self._model is None:
@@ -155,6 +161,17 @@ class InferenceEngine:
             if model_id == COUNTGD_MODEL_ID:
                 return self._load_countgd_model(device).count(
                     references, image_paths, str(directory), confidence, label)
+            if model_id == PETDINO_MODEL_ID:
+                if self._model_id != PETDINO_MODEL_ID or self._model is None:
+                    from .petdino import PetDINOEngine
+                    self._unload_model()
+                    self._model = PetDINOEngine(petdino_dir(), f"cuda:{device}" if device.isdigit() else device)
+                    self._model_id = PETDINO_MODEL_ID
+                try:
+                    return self._model.count(references, image_paths, str(directory), confidence, label)
+                except Exception:
+                    self._unload_model()
+                    raise
             model = self._load_model(model_id)
             from ultralytics.models.yolo.yoloe import YOLOEVPSegPredictor
             image_size = int(os.environ.get("IMGSZ", "640"))

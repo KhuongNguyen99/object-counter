@@ -242,6 +242,8 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None):
     async def lifespan(_app):
         yield
         executor.shutdown(wait=True)
+        if engine is not None and hasattr(engine, "close"):
+            engine.close()
 
     app = FastAPI(title="Object Counting", lifespan=lifespan)
     app.add_middleware(BodyLimitMiddleware)

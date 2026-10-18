@@ -18,6 +18,12 @@ MODEL_ASSETS = {
 MODEL_FILENAMES = tuple(MODEL_ASSETS)
 SIZE_NAMES = {"n": "Nano", "s": "Small", "m": "Medium", "l": "Large", "x": "Extra large"}
 COUNTGD_MODEL_ID = "countgd-plusplus"
+PETDINO_MODEL_ID = "pet-dino-swin-t"
+# Official fuweifu/PET-DINO checkpoint at a8d8cddbe752bbcc3df299b2fe56d0aa67a26776.
+PETDINO_ASSETS = {
+    "pet_dino_swin-t_8xb4_12e_obj365.pth": (
+        2309043797, "beff20e86a46008b637edf6f519f100cb69981d1c116a03959663d276adc1736"),
+}
 # Downloaded from the official CountGD++ checkpoint and its official BERT preparation recipe.
 COUNTGD_ASSETS = {
     "countgd_plusplus.pth": (1250122586, "b89395d79711c9b9f13f3ef80cd2e528386fb1d70453f99443be4eccab33592f"),
@@ -36,6 +42,25 @@ def model_dir() -> Path:
 
 def countgd_dir() -> Path:
     return model_dir() / "countgd"
+
+
+def petdino_dir() -> Path:
+    return model_dir() / "petdino"
+
+
+def validate_petdino_assets(directory: Path | None = None) -> None:
+    directory = directory or petdino_dir()
+    assets = [(directory / name, size, digest) for name, (size, digest) in PETDINO_ASSETS.items()]
+    assets.extend((countgd_dir() / name, size, digest) for name, (size, digest) in COUNTGD_ASSETS.items()
+                  if name.startswith("bert-base-uncased/"))
+    for path, size, digest in assets:
+        if not path.is_file():
+            raise FileNotFoundError(f"PET-DINO asset {path.name} is missing. Run python scripts/prepare_petdino.py.")
+        if path.stat().st_size != size:
+            raise ValueError(f"PET-DINO asset {path.name} is incomplete or invalid.")
+        with path.open("rb") as stream:
+            if hashlib.file_digest(stream, "sha256").hexdigest() != digest:
+                raise ValueError(f"PET-DINO asset {path.name} failed SHA-256 validation.")
 
 
 def validate_countgd_assets(directory: Path | None = None) -> None:
@@ -97,5 +122,19 @@ def list_models() -> list[dict]:
         "available": source_ready and all(path.is_file() and path.stat().st_size == expected_bytes
                          for path, (expected_bytes, _) in zip(paths, COUNTGD_ASSETS.values())),
         "bytes": sum(path.stat().st_size for path in paths if path.is_file()),
+    })
+    pet_paths = [petdino_dir() / name for name in PETDINO_ASSETS]
+    pet_source = Path(os.environ.get("PETDINO_SOURCE_DIR", "/opt/petdino"))
+    pet_python = Path(os.environ.get("PETDINO_PYTHON", "/opt/petdino-venv/bin/python"))
+    result.insert(1, {
+        "id": PETDINO_MODEL_ID, "name": "PET-DINO Swin-T (experimental)",
+        "family": "PET-DINO", "size": "t", "default_confidence": .3,
+        "available": pet_python.is_file() and
+                     (pet_source / "configs/pet_dino/pet_dino_swin-t_8xb4_12e_obj365.py").is_file() and
+                     all(path.is_file() and path.stat().st_size == size
+                         for path, (size, _) in zip(pet_paths, PETDINO_ASSETS.values())) and
+                     all((countgd_dir() / name).is_file() and (countgd_dir() / name).stat().st_size == size
+                         for name, (size, _) in COUNTGD_ASSETS.items() if name.startswith("bert-base-uncased/")),
+        "bytes": sum(path.stat().st_size for path in pet_paths if path.is_file()),
     })
     return result

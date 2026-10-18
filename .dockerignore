@@ -1,5 +1,7 @@
 .git
 .venv
+.vendor
+.codex-remote-attachments
 venv
 node_modules
 data
