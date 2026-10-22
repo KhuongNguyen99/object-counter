@@ -10,29 +10,35 @@ Countwell counts objects in photos on your computer or private network. New coun
 
 ## Run with Docker
 
-The backend build context needs `models/FastSAM-s.pt` and `models/countgd/`. It verifies their contents and prepares pinned CountGD++ source and offline text assets. If a fresh checkout lacks them, prepare them with Python 3.11 before building:
+Install Python 3.11 or newer and start Docker with Linux containers and Docker Compose 2.30 or newer. On Windows, use Docker Desktop with its WSL2 backend. On Linux, use Docker Engine and the Compose plugin; NVIDIA GPU use also requires NVIDIA Container Toolkit. From the repository root, start the entire app with one command:
 
-```sh
-python -m pip install -r requirements.txt
-python scripts/download_models.py --model-dir models --models FastSAM-s
-python scripts/prepare_countgd.py --source-dir .vendor/countgd
+```powershell
+# Windows
+py -3 run.py
 ```
 
-The first download is large. The backend build downloads any missing CountGD++ assets and verifies their checksums. No SAM3 checkpoint is needed. For CPU counting, start both services:
-
 ```sh
-docker compose up --build -d
+# Linux
+python3 run.py
 ```
 
-Open **http://localhost:8080**. On a phone on the same Wi-Fi, use `http://YOUR-COMPUTER-LAN-IP:8080`; your computer may need to allow inbound TCP port 8080 on its private network. The backend API is exposed only on **http://127.0.0.1:8082** by default; its interactive documentation is at [http://127.0.0.1:8082/docs](http://127.0.0.1:8082/docs). The Camera button uses the browser's photo picker or camera, depending on the device.
+The launcher prepares and checks FastSAM-s using Python's standard library, then builds and starts the frontend and backend containers. The backend build downloads and verifies CountGD++ and BERT assets. No host machine learning packages or SAM3 checkpoint are needed. The first build needs an internet connection and downloads several large assets; unchanged builds use Docker's cache. Changes that invalidate asset preparation can repeat the large downloads. The launcher detects NVIDIA access through Docker and uses the GPU when available, otherwise the CPU. Add `--cpu` to force CPU mode or `--gpu` to require a working CUDA container; `--gpu` fails if that check fails. Add `--no-build` for a quick restart with already built images, without checking or downloading model assets.
 
-For an NVIDIA GPU with Docker GPU support enabled (NVIDIA Container Toolkit on Linux, or Docker Desktop with WSL2 and supported drivers on Windows):
+The script starts the services in the background, waits for them to become healthy, and prints the app URL. Open **http://localhost:8080** by default. On a phone on the same Wi-Fi, use `http://YOUR-COMPUTER-LAN-IP:8080`; your computer may need to allow inbound TCP port 8080 on its private network. The backend API is exposed only on **http://127.0.0.1:8082** by default; its interactive documentation is at [http://127.0.0.1:8082/docs](http://127.0.0.1:8082/docs). The Camera button uses the browser's photo picker or camera, depending on the device.
+
+To stop both services while keeping saved counts:
+
+```sh
+docker compose stop
+```
+
+You can also use Compose directly after the launcher has prepared the model assets. The CPU command is `docker compose up --build -d`; for an NVIDIA GPU with Docker GPU support enabled, use:
 
 ```sh
 docker compose -f compose.yaml -f compose.gpu.yaml up --build -d
 ```
 
-The GPU override applies only to the `counter` backend and uses CUDA 12.8 PyTorch. Keep both Compose files in later GPU commands. Run the regular CPU command with `--build` to switch back. Both use the unchanged `counter-data` volume. Sessions, uploaded photos, and annotated results survive restarts and `docker compose down`; **`docker compose down -v` deletes the volume**. Use `docker compose logs -f counter` or `docker compose logs -f frontend` to inspect errors.
+The GPU override applies only to the `counter` backend and uses CUDA 12.8 PyTorch. Keep both Compose files in later GPU commands. Run the regular CPU command with `--build` to switch back. Both use the unchanged `counter-data` volume. Sessions, uploaded photos, and annotated results survive restarts and `docker compose down`; **`docker compose down -v` deletes the volume**. Use `docker compose logs -f counter` or `docker compose logs -f frontend` to inspect errors. Copy `.env.example` to `.env` to change ports, binding addresses, and other settings described below.
 
 ### Private Tailscale access
 
@@ -86,7 +92,7 @@ Existing saved counts from earlier model experiments can still be viewed, review
 
 CountGD++ uses its official checkpoint and source pinned to commit `8489f836d75eb407ae778c56cff1f72cc6f8baae`. The backend image retains its source and licenses at `/opt/countgd`. FastSAM-s uses the official Ultralytics asset, verified against its pinned size and SHA-256 digest. See the [CountGD++ repository](https://github.com/niki-amini-naieni/CountGDPlusPlus) and [Ultralytics FastSAM documentation](https://docs.ultralytics.com/models/fast-sam/) for upstream source and license terms. Both assets are bundled into the backend for offline use after build.
 
-For local CPU development, install Python 3.11, the CPU PyTorch wheels (`torch==2.9.1`, `torchvision==0.24.1`), and `requirements-dev.txt`. Prepare the two assets as above and set `COUNTGD_SOURCE_DIR` to the absolute `.vendor/countgd` path. Starting both services with Docker Compose is the easiest way to get the proxy settings right. To run them directly, set `FRONTEND_ORIGINS=http://localhost:8080` for the backend, set `frontend/public/config.js` to `apiBaseUrl: "http://localhost:8082"`, and start two terminals:
+For local CPU development, install Python 3.11, the CPU PyTorch wheels (`torch==2.9.1`, `torchvision==0.24.1`), and `requirements-dev.txt`. Prepare the FastSAM-s asset with `python scripts/download_models.py --model-dir models --models FastSAM-s`, prepare CountGD++ source with `python scripts/prepare_countgd.py --source-dir .vendor/countgd`, and set `COUNTGD_SOURCE_DIR` to the absolute `.vendor/countgd` path. Starting both services with Docker Compose is the easiest way to get the proxy settings right. To run them directly, set `FRONTEND_ORIGINS=http://localhost:8080` for the backend, set `frontend/public/config.js` to `apiBaseUrl: "http://localhost:8082"`, and start two terminals:
 
 ```sh
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8082 --workers 1
