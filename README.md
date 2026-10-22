@@ -4,6 +4,18 @@ Countwell counts objects in photos using a browser frontend and a local model ba
 
 The frontend and backend run in separate containers. Nginx serves the UI and proxies API requests to FastAPI, which owns inference, counting jobs, and saved data. Inference runs locally without a cloud API or API key.
 
+## Demos
+
+Original photos are on the left; counted results are on the right.
+
+![Demo 1: original photo beside counted result](docs/images/demo-01.jpg)
+
+![Demo 2: original photo beside counted result](docs/images/demo-02.jpg)
+
+![Demo 3: original photo beside counted result](docs/images/demo-03.jpg)
+
+![Demo 4: original photo beside counted result](docs/images/demo-04.jpg)
+
 ## Run
 
 You need Python 3.11+, Docker with Linux containers, and Docker Compose 2.30+. Use Docker Desktop with WSL2 on Windows. NVIDIA GPU support on Linux requires NVIDIA Container Toolkit.
