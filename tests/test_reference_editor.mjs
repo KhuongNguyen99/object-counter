@@ -3,8 +3,8 @@ import { readFileSync } from "node:fs";
 import vm from "node:vm";
 import test from "node:test";
 
-const source = readFileSync(new URL("../app/static/reference-review.js", import.meta.url), "utf8");
-const markup = readFileSync(new URL("../app/static/index.html", import.meta.url), "utf8");
+const source = readFileSync(new URL("../frontend/public/reference-review.js", import.meta.url), "utf8");
+const markup = readFileSync(new URL("../frontend/public/index.html", import.meta.url), "utf8");
 
 function fixture(config = {}) {
   const nodes = new Map();

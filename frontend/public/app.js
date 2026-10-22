@@ -1,6 +1,18 @@
 (() => {
   const $ = (id) => document.getElementById(id);
-  const storageKey = "countwell.sessionId";
+  const configuredBase = globalThis.COUNTWELL_CONFIG?.apiBaseUrl ?? "";
+  let apiBase = "";
+  let apiConfigError = false;
+  if (configuredBase !== "") {
+    try {
+      if (typeof configuredBase !== "string" || !/^https?:\/\//i.test(configuredBase)) throw new Error("Invalid API address");
+      const url = new URL(configuredBase);
+      if (!/^https?:$/.test(url.protocol) || !url.hostname || url.username || url.password || url.search || url.hash) throw new Error("Invalid API address");
+      apiBase = `${url.origin}${url.pathname.replace(/\/+$/, "")}`;
+    } catch { apiConfigError = true; }
+  }
+  const apiUrl = (path) => !apiBase || !path || /^(?:[a-z][a-z\d+.-]*:|\/\/)/i.test(path) ? path : `${apiBase}${path.startsWith("/") ? "" : "/"}${path}`;
+  const storageKey = apiBase ? `countwell.sessionId.${encodeURIComponent(apiBase)}` : "countwell.sessionId";
   const confidenceStoragePrefix = "countwell.confidence.";
   const svgNs = "http://www.w3.org/2000/svg";
   const maxFileBytes = 20 * 1024 * 1024;
@@ -80,7 +92,8 @@
   }
 
   async function request(path, options) {
-    const response = await fetch(path, options);
+    if (apiConfigError) throw new Error("This page could not connect to counting. Ask for help with the app setup.");
+    const response = await fetch(apiUrl(path), options);
     let data;
     try { data = await response.json(); } catch { data = {}; }
     if (!response.ok) {
@@ -474,12 +487,12 @@
     preview.type = "button";
     preview.setAttribute("aria-label", `Enlarge result for ${result.filename}`);
     const image = node("img");
-    image.src = result.annotated_url || result.original_url;
+    image.src = apiUrl(result.annotated_url || result.original_url);
     image.alt = `Annotated count for ${result.filename}`;
     preview.append(image, node("span", "preview-hint", "Enlarge"));
     preview.addEventListener("click", () => {
       $("dialog-title").textContent = result.filename;
-      $("dialog-image").src = result.annotated_url || result.original_url;
+      $("dialog-image").src = apiUrl(result.annotated_url || result.original_url);
       $("image-dialog").showModal();
     });
     const body = node("div", "result-body");
@@ -520,7 +533,7 @@
     $("results-state").textContent = hasPending() ? "Counting" : needsReview ? "Review needed" : session.status === "finished" ? "Finished" : "Up to date";
     $("results-state").classList.toggle("error", needsReview);
     if (session.image_count > 0 && session.total_count === 0) $("metric-status").textContent = needsReview ? "No matches · review needed" : "0 objects · reviewed";
-    $("export-link").href = `/api/sessions/${encodeURIComponent(session.id)}/export.csv`;
+    $("export-link").href = apiUrl(`/api/sessions/${encodeURIComponent(session.id)}/export.csv`);
     $("next-batch-panel").hidden = session.status === "finished" || !canContinueSession();
     $("new-count-button").hidden = hasPending() || session.status !== "finished" && canContinueSession();
     const list = $("batch-list");
@@ -560,7 +573,7 @@
     const verification = result.verification;
     const secondaryAvailable = verification?.status === "complete" && Array.isArray(verification.secondary_detections);
     return { imageId: result.id, filename: result.filename, revision: result.review_revision || 0,
-      width: result.width, height: result.height, imageUrl: result.original_url,
+      width: result.width, height: result.height, imageUrl: apiUrl(result.original_url),
       boxes, savedBoxes: boxes.map((box) => [...box]),
       modelCount: result.model_count ?? result.count, reviewed: !!result.reviewed, clipped,
       secondaryAvailable, secondaryFailed: verification?.status === "failed", showSecondary: false,

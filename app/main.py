@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -16,10 +17,11 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
-from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps, UnidentifiedImageError
 from starlette.concurrency import run_in_threadpool
 
@@ -40,11 +42,19 @@ DEFAULT_MODEL = COUNTGD_MODEL_ID
 LEGACY_REFERENCE_MODES = {SAM3_MODEL_ID: "per_image", SAM3COUNT_MODEL_ID: "none"}
 
 
-class RevalidatingStaticFiles(StaticFiles):
-    async def get_response(self, path, scope):
-        response = await super().get_response(path, scope)
-        response.headers["Cache-Control"] = "no-cache"
-        return response
+class _CORSFastAPI(FastAPI):
+    def __init__(self, *args, allowed_origins, **kwargs):
+        self.allowed_origins = allowed_origins
+        super().__init__(*args, **kwargs)
+
+    def build_middleware_stack(self):
+        # Wrap FastAPI's error handler so even unexpected 500 responses carry CORS.
+        return CORSMiddleware(super().build_middleware_stack(),
+                              allow_origins=self.allowed_origins,
+                              allow_methods=["GET", "POST"],
+                              allow_headers=["Content-Type"],
+                              expose_headers=["Content-Disposition"],
+                              allow_credentials=False)
 
 
 class BodyLimitMiddleware:
@@ -235,7 +245,38 @@ def _validate_reference_proposal(value, width, height):
             "warning": warning[:500] if warning else None}
 
 
-def create_app(data_dir=None, engine_factory=None, model_lister=None):
+_ORIGIN_PATTERN = re.compile(
+    r"https?://(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::[0-9]{1,5})?/?\Z",
+    re.IGNORECASE,
+)
+
+
+def _parse_frontend_origins(value):
+    origins = []
+    entries = value.split(",") if isinstance(value, str) else value
+    for entry in entries:
+        if not isinstance(entry, str):
+            raise ValueError("FRONTEND_ORIGINS must contain only HTTP(S) origins")
+        origin = entry.strip()
+        if not origin:
+            continue
+        if not _ORIGIN_PATTERN.fullmatch(origin):
+            raise ValueError(f"FRONTEND_ORIGINS must contain only HTTP(S) origins: {origin!r}")
+        try:
+            port = urlsplit(origin).port
+        except ValueError as exc:
+            raise ValueError(f"FRONTEND_ORIGINS contains an invalid port: {origin!r}") from exc
+        if port == 0:
+            raise ValueError(f"FRONTEND_ORIGINS contains an invalid port: {origin!r}")
+        origin = origin.rstrip("/").lower()
+        if origin not in origins:
+            origins.append(origin)
+    return origins
+
+
+def create_app(data_dir=None, engine_factory=None, model_lister=None, frontend_origins=None):
+    allowed_origins = _parse_frontend_origins(
+        os.environ.get("FRONTEND_ORIGINS", "") if frontend_origins is None else frontend_origins)
     data_dir = Path(data_dir or os.environ.get("DATA_DIR", "data")).resolve()
     store = Store(data_dir)
     slots = threading.BoundedSemaphore(MAX_QUEUE)
@@ -261,7 +302,8 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None):
         if engine is not None and hasattr(engine, "close"):
             engine.close()
 
-    app = FastAPI(title="Object Counting", lifespan=lifespan)
+    app = _CORSFastAPI(title="Object Counting", lifespan=lifespan,
+                       allowed_origins=allowed_origins)
     app.add_middleware(BodyLimitMiddleware)
     app.state.store = store
 
@@ -664,8 +706,6 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None):
             raise HTTPException(404, "File not found")
         return FileResponse(path, media_type="image/jpeg")
 
-    static_dir = Path(__file__).parent / "static"
-    app.mount("/", RevalidatingStaticFiles(directory=static_dir, html=True, check_dir=False), name="static")
     return app
 
 

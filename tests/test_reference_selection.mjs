@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 
-const source = readFileSync(new URL("../app/static/reference-selection.js", import.meta.url), "utf8");
+const source = readFileSync(new URL("../frontend/public/reference-selection.js", import.meta.url), "utf8");
 const context = vm.createContext({});
 vm.runInContext(source, context, { filename: "reference-selection.js" });
 const { prepare } = context.ReferenceSelection;

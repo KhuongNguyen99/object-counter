@@ -5,6 +5,8 @@ const zlib = require('node:zlib');
 const assert = require('node:assert/strict');
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright-core');
 const root = path.resolve(__dirname, '..');
+const separateOrigins = process.env.E2E_SEPARATE_ORIGINS === '1';
+const apiPrefix = separateOrigins ? '/service' : '';
 const os = require('node:os');
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'simple-counting-e2e-'));
 function crc32(bytes) {
@@ -45,6 +47,7 @@ const photo = path.join(temp, 'parts.png');
 fs.writeFileSync(photo, png());
 const fixture = {width:1000,height:800,boxes:Array.from({length:40},(_,i)=>{const x=80+(i%10)*90,y=70+Math.floor(i/10)*170;return [x,y,x+40,y+30];})};
 let session, submitted, detects = 0;
+let frontendOrigin;
 const uploads = [];
 const catalog = { default_model:'countgd-plusplus', models:[{id:'countgd-plusplus', name:'CountGD++',available:true,
   reference_mode:'per_image',required_reference_boxes:10,default_confidence:.8}],device:'cuda' };
@@ -56,7 +59,15 @@ async function body(req) {const chunks=[];for await(const chunk of req)chunks.pu
 function field(input,name) {return new RegExp('name="'+name+'"\\r\\n\\r\\n([^\\r]*)').exec(input)?.[1];}
 const server = http.createServer(async(req,res)=>{
   try {
-    const url = req.url.split('?')[0];
+    if (separateOrigins) {
+      res.setHeader('Access-Control-Allow-Origin', frontendOrigin);
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+      if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
+    }
+    const requested = req.url.split('?')[0];
+    if (separateOrigins && !requested.startsWith(apiPrefix + '/')) return json(res,{detail:'Not found'},404);
+    const url = separateOrigins ? requested.slice(apiPrefix.length) : requested;
     if(url==='/api/models')return json(res,catalog);
     if(url==='/api/reference-boxes') {await body(req); detects++;return json(res,fixture);}
     if(url==='/api/sessions' && req.method==='POST') {
@@ -83,21 +94,39 @@ const server = http.createServer(async(req,res)=>{
       result.detections=data.boxes.map((box,index)=>({box,index:index+1}));session.total_count=result.count;
       return json(res,session);
     }
-    const file=url==='/photo.jpg'?photo:path.join(root,'app/static',url==='/'?'index.html':url.slice(1));
+    const file=url==='/photo.jpg'?photo:path.join(root,'frontend/public',url==='/'?'index.html':url.slice(1));
     res.writeHead(200,{'content-type':{'.html':'text/html','.js':'text/javascript','.css':'text/css','.jpg':'image/jpeg','.png':'image/png','.svg':'image/svg+xml'}[path.extname(file)]});
     fs.createReadStream(file).pipe(res);
   }catch(error){json(res,{detail:error.message},500);}
 });
+const frontendServer = separateOrigins ? http.createServer((req,res)=>{
+  const url = req.url.split('?')[0];
+  if (url === '/config.js') {
+    res.writeHead(200,{'content-type':'text/javascript','cache-control':'no-store'});
+    return res.end(`globalThis.COUNTWELL_CONFIG = { apiBaseUrl: ${JSON.stringify('http://127.0.0.1:' + server.address().port + apiPrefix)} };`);
+  }
+  if (url.startsWith('/api/') || url === '/photo.jpg') { res.writeHead(404); return res.end(); }
+  const file=path.join(root,'frontend/public',url==='/'?'index.html':url.slice(1));
+  res.writeHead(200,{'content-type':{'.html':'text/html','.js':'text/javascript','.css':'text/css','.svg':'image/svg+xml'}[path.extname(file)]});
+  fs.createReadStream(file).pipe(res);
+}) : null;
 (async()=>{
   fs.mkdirSync(out,{recursive:true});
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  if (frontendServer) await new Promise(resolve=>frontendServer.listen(0,'127.0.0.1',resolve));
+  frontendOrigin = 'http://127.0.0.1:' + (frontendServer || server).address().port;
+  const backendOrigin = 'http://127.0.0.1:' + server.address().port;
   const browser=await chromium.launch({executablePath:process.env.EDGE_EXE || 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',headless:true});
   try {
     const page=await browser.newPage({viewport:{width:1440,height:1100}}),errors=[];
     page.setDefaultTimeout(20000);
     page.on('pageerror',e=>errors.push(e.message));
-    const base='http://127.0.0.1:'+server.address().port;
+    const base=frontendOrigin;
     await page.goto(base);
+    if (separateOrigins) {
+      assert.notEqual(new URL(base).origin, new URL(backendOrigin).origin);
+      assert.equal(await page.evaluate(()=>globalThis.COUNTWELL_CONFIG.apiBaseUrl),backendOrigin + apiPrefix);
+    }
     await page.waitForFunction(()=>!document.querySelector('#start-button').disabled);
     assert.equal(await page.locator('#model-select').isVisible(),false);
     assert.equal(await page.locator('#confidence').inputValue(),'0.8');
@@ -143,11 +172,19 @@ const server = http.createServer(async(req,res)=>{
     assert.equal(await page.locator('#reference-zoom-reset').innerText(),'100%');
     await page.locator('#start-button').click();
     await page.waitForFunction(()=>document.querySelector('#metric-total').textContent==='14');
+    if (separateOrigins) {
+      assert.equal(await page.locator('.result-image img').first().getAttribute('src'),backendOrigin + apiPrefix + '/photo.jpg');
+      assert.equal(await page.locator('#export-link').getAttribute('href'),backendOrigin + apiPrefix + '/api/sessions/simple/export.csv');
+      await page.locator('.result-image').first().click();
+      assert.equal(await page.locator('#dialog-image').getAttribute('src'),backendOrigin + apiPrefix + '/photo.jpg');
+      await page.locator('#close-dialog').click();
+    }
     assert.equal(submitted.model,'countgd-plusplus');assert.equal(submitted.confidence,'0.8');
     assert.equal(submitted.boxes[0].length,10);assert.equal(submitted.label,'');
     await noJargon();await page.screenshot({path:path.join(out,'results-desktop.png'),fullPage:true});
     await page.getByRole('button',{name:'Review photo',exact:true}).click();
     await page.locator('#review-image').waitFor();
+    if (separateOrigins) assert.equal(await page.locator('#review-image').getAttribute('src'),backendOrigin + apiPrefix + '/photo.jpg');
     await noJargon();assert.equal(await page.locator('#review-count').innerText(),'1 counted');
     await page.locator('#review-save').click();
     await page.waitForFunction(()=>!document.querySelector('#review-confirm').disabled);
@@ -182,12 +219,13 @@ const server = http.createServer(async(req,res)=>{
     assert.match(await page.locator('#batch-list').innerText(),/Quick count/);
     await page.reload();
     await page.waitForFunction(()=>document.querySelectorAll('#batch-list .batch-card').length===2);
+    if (separateOrigins) assert.equal(await page.locator('.result-image img').first().getAttribute('src'),backendOrigin + apiPrefix + '/photo.jpg');
     assert.match(await page.locator('#batch-list').innerText(),/Quick count/);
     await noJargon();
     await page.screenshot({path:path.join(out,'quick-results-mobile.png'),fullPage:true});
 
     // Starting a fresh quick count also bypasses examples and stays alongside the main action.
-    await page.evaluate(()=>localStorage.removeItem('countwell.sessionId'));
+    await page.evaluate(key=>localStorage.removeItem(key),separateOrigins ? 'countwell.sessionId.' + encodeURIComponent(backendOrigin + apiPrefix) : 'countwell.sessionId');
     await page.reload();
     await page.waitForFunction(()=>!document.querySelector('#quick-count-button').disabled);
     await page.locator('#target-gallery').setInputFiles(photo);
@@ -207,7 +245,7 @@ const server = http.createServer(async(req,res)=>{
     assert.deepEqual(errors,[]);
     fs.writeFileSync(path.join(out,'report.json'),JSON.stringify({selected:10,detects,uploads,errors,widths:[1440,390,320]},null,2));
     console.log('PASS: standard and Quick count, required marked areas, no examples for Quick count, later batches, reload, desktop/mobile, review and shortcuts');
-  }finally{await browser.close();await new Promise(resolve=>server.close(resolve));
+  }finally{await browser.close();if (frontendServer) await new Promise(resolve=>frontendServer.close(resolve));await new Promise(resolve=>server.close(resolve));
     const resolved=fs.realpathSync(temp);assert.equal(path.dirname(resolved),fs.realpathSync(os.tmpdir()));
     assert.ok(path.basename(resolved).startsWith('simple-counting-e2e-'));fs.rmSync(resolved,{recursive:true,force:true});}
 })().catch(e=>{console.error(e);process.exitCode=1;});

@@ -3,11 +3,11 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 
-const source = readFileSync(new URL("../app/static/app.js", import.meta.url), "utf8").replace(
+const source = readFileSync(new URL("../frontend/public/app.js", import.meta.url), "utf8").replace(
   /\}\)\(\);\s*$/,
   "globalThis.testApp = { state, render, openReview, saveReview, finishCount, reloadReview };})();",
 );
-const referenceEditorSource = readFileSync(new URL("../app/static/reference-review.js", import.meta.url), "utf8");
+const referenceEditorSource = readFileSync(new URL("../frontend/public/reference-review.js", import.meta.url), "utf8");
 
 class Element {
   constructor(tag = "div") {
@@ -71,7 +71,7 @@ const session = () => ({
   }] }],
 });
 
-function browser(fetch, confirm = () => true) {
+function browser(fetch, confirm = () => true, apiBaseUrl = "") {
   const elements = new Map();
   const document = {
     getElementById(id) {
@@ -83,14 +83,17 @@ function browser(fetch, confirm = () => true) {
     querySelectorAll: () => [],
   };
   document.getElementById("reference-crop").append(new Element("img"));
+  class BrowserURL extends URL {}
+  BrowserURL.revokeObjectURL = () => {};
   const context = {
     document,
-    fetch: (path, options) => path === "/api/models" ? Promise.resolve(response({
+    COUNTWELL_CONFIG: { apiBaseUrl },
+    fetch: (path, options) => path.endsWith("/api/models") ? Promise.resolve(response({
       models: [{ id: "crosscheck-countgd-yoloe26x", name: "CountGD++ + YOLOE", available: true }],
       default_model: "crosscheck-countgd-yoloe26x", device: "cpu",
     })) : fetch(path, options),
     localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
-    URL: { revokeObjectURL() {} },
+    URL: BrowserURL,
     Option: class extends Element { constructor(label, value) { super("option"); this.textContent = label; this.value = value; } },
     setTimeout: () => 1, clearTimeout() {}, window: { scrollTo() {}, confirm },
   };
@@ -153,6 +156,22 @@ test("review requires explicit acceptance, supports undo and add/remove, then sa
   assert.equal(app.state.review, null);
   assert.equal(app.get("finish-button").disabled, false);
   assert.equal(app.get("finish-review-hint").hidden, true);
+});
+
+test("review loads the original photo and saves changes through a separate backend", async () => {
+  const calls = [];
+  const saved = session();
+  const app = browser(async (path, options) => {
+    calls.push([path, options?.method || "GET"]);
+    return response(saved);
+  }, () => true, "http://127.0.0.1:9000/count/");
+  await settle();
+  app.state.session = saved;
+  app.render();
+  app.openReview("image-1");
+  assert.equal(app.get("review-image").src, "http://127.0.0.1:9000/count/original.jpg");
+  await app.saveReview(false);
+  assert.ok(calls.some(([path, method]) => path === "http://127.0.0.1:9000/count/api/sessions/session-1/images/image-1/review" && method === "POST"));
 });
 
 test("all second-model boxes are view-only and never alter saved count", async () => {

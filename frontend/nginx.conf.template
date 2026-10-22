@@ -1,0 +1,41 @@
+server {
+    listen 8080;
+    server_name _;
+    root /usr/share/nginx/html;
+    index index.html;
+    client_max_body_size 450m;
+
+    # Resolve again after an independent backend container replacement.
+    resolver 127.0.0.11 valid=5s ipv6=off;
+    set $counting_backend "${BACKEND_URL}";
+
+    location = /healthz {
+        access_log off;
+        default_type text/plain;
+        return 200 "ok\n";
+    }
+
+    location ~ ^/(api|reports)/ {
+        proxy_pass $counting_backend$request_uri;
+        proxy_http_version 1.1;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_connect_timeout 10s;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+        proxy_request_buffering off;
+        proxy_buffering off;
+    }
+
+    location = /config.js {
+        add_header Cache-Control "no-store" always;
+        etag off;
+        try_files $uri =404;
+    }
+
+    location / {
+        add_header Cache-Control "no-cache" always;
+        try_files $uri $uri/ =404;
+    }
+}

@@ -12,7 +12,7 @@ const base = process.env.APP_URL || 'http://localhost:8080';
 const output = path.resolve(process.env.E2E_OUTPUT_DIR || path.join(root, 'test-results/countgd-ten/browser'));
 const report = { base, startedAt: new Date().toISOString(), errors: [], proposals: [], requests: [] };
 const algorithm = vm.createContext({});
-vm.runInContext(fs.readFileSync(path.join(root, 'app/static/reference-selection.js'), 'utf8'), algorithm);
+vm.runInContext(fs.readFileSync(path.join(root, 'frontend/public/reference-selection.js'), 'utf8'), algorithm);
 
 async function settled(context, id, batches) {
   const deadline = Date.now() + 600000;

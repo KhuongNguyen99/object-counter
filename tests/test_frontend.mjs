@@ -4,12 +4,12 @@ import test from "node:test";
 import vm from "node:vm";
 
 // Exercise the actual browser handlers with deferred network responses, without a browser dependency.
-const source = readFileSync(new URL("../app/static/app.js", import.meta.url), "utf8").replace(
+const source = readFileSync(new URL("../frontend/public/app.js", import.meta.url), "utf8").replace(
   /\}\)\(\);\s*$/,
-  "globalThis.testApp = { state, render, addReferences, addTargets, uploadBatch, finishCount, referenceReview };})();",
+  "globalThis.testApp = { state, render, addReferences, addTargets, uploadBatch, finishCount, referenceReview, apiUrl };})();",
 );
-const referenceEditorSource = readFileSync(new URL("../app/static/reference-review.js", import.meta.url), "utf8");
-const selectionSource = readFileSync(new URL("../app/static/reference-selection.js", import.meta.url), "utf8");
+const referenceEditorSource = readFileSync(new URL("../frontend/public/reference-review.js", import.meta.url), "utf8");
+const selectionSource = readFileSync(new URL("../frontend/public/reference-selection.js", import.meta.url), "utf8");
 
 class Element {
   constructor(tag = "div") {
@@ -33,6 +33,8 @@ class Element {
   setAttribute(name, value) { this[name] = value; }
   getAttribute(name) { return this[name]; }
   addEventListener(type, listener) { this.listeners[type] = listener; }
+  showModal() { this.open = true; }
+  close() { this.open = false; this.listeners.close?.(); }
   reset() {}
   focus() { this.focused = true; }
   querySelector(selector) {
@@ -78,7 +80,7 @@ const deferred = () => {
 };
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
-function browser(fetch, savedId = null, modelCatalog = catalog, storage = new Map()) {
+function browser(fetch, savedId = null, modelCatalog = catalog, storage = new Map(), apiBaseUrl = "") {
   const elements = new Map();
   const timers = new Map();
   const revoked = [];
@@ -106,15 +108,20 @@ function browser(fetch, savedId = null, modelCatalog = catalog, storage = new Ma
     },
   };
   document.getElementById("reference-crop").append(new Element("img"));
+  const sessionKey = apiBaseUrl ? `countwell.sessionId.${encodeURIComponent(apiBaseUrl.replace(/\/+$/, ""))}` : "countwell.sessionId";
+  class BrowserURL extends URL {}
+  BrowserURL.createObjectURL = (() => { let next = 0; return () => `blob:reference-${++next}`; })();
+  BrowserURL.revokeObjectURL = (url) => { revoked.push(url); };
   const context = {
     document,
-    fetch: (path, options) => path === "/api/models" ? Promise.resolve(response(modelCatalog)) : fetch(path, options),
+    COUNTWELL_CONFIG: { apiBaseUrl },
+    fetch: (path, options) => path.endsWith("/api/models") ? Promise.resolve(response(modelCatalog)) : fetch(path, options),
     localStorage: {
-      getItem(key) { return key === "countwell.sessionId" && savedId !== null ? savedId : storage.get(key) ?? null; },
+      getItem(key) { return key === sessionKey && savedId !== null ? savedId : storage.get(key) ?? null; },
       setItem(key, value) { storage.set(key, String(value)); },
       removeItem(key) { storage.delete(key); },
     },
-    URL: { createObjectURL: (() => { let next = 0; return () => `blob:reference-${++next}`; })(), revokeObjectURL(url) { revoked.push(url); } },
+    URL: BrowserURL,
     createImageBitmap: async (file) => { decoded.push(file); return { width: file.width, height: file.height, close() {} }; },
     File: class {
       constructor(parts, name, options) {
@@ -208,6 +215,63 @@ test("restoring a saved session keeps setup locked and resumes polling a pending
   assert.equal(app.get("upload-button").disabled, true);
   assert.equal(app.get("finish-button").disabled, true);
   assert.equal(app.timers.size, 1, "pending results must resume automatic polling");
+});
+
+test("a configured backend prefixes requests, result photos, export, and resumed polling", async () => {
+  const base = "https://count.example/service/";
+  const prefix = "https://count.example/service";
+  const storage = new Map([["countwell.sessionId", "other-backend-session"]]);
+  const calls = [];
+  const saved = session();
+  saved.image_count = 1;
+  saved.batches.push({ id: "batch-1", status: "complete", total_count: 1, results: [{
+    id: "image-1", filename: "apple.jpg", count: 1, width: 100, height: 80,
+    original_url: "/images/original.jpg", annotated_url: "/images/annotated.jpg", detections: [],
+  }] });
+  const app = browser(async (path, options) => {
+    calls.push([path, options?.method || "GET"]);
+    if (path.endsWith("/batches")) return response({ id: "batch-2" }, 202);
+    if (path.endsWith("/finish")) return response({ ...saved, status: "finished" });
+    return response(saved);
+  }, null, catalog, storage, base);
+  await settle();
+  assert.equal(app.state.restoring, false, "a same-origin session belongs to a different backend");
+  assert.equal(app.apiUrl("/api/models"), `${prefix}/api/models`);
+  assert.equal(app.apiUrl("blob:upload"), "blob:upload");
+  assert.equal(app.apiUrl("https://cdn.example/image.jpg"), "https://cdn.example/image.jpg");
+  app.state.refs.push({ file: { name: "example.jpg" }, url: "blob:example", boxes: [[1, 2, 20, 30]], candidates: [] });
+  app.state.targets.push({ file: { name: "apple.jpg" }, url: "blob:upload" });
+  await app.get("start-button").listeners.click();
+  assert.ok(calls.some(([url, method]) => url === `${prefix}/api/sessions` && method === "POST"));
+  assert.equal(storage.get(`countwell.sessionId.${encodeURIComponent(prefix)}`), "saved-session");
+  assert.equal(app.get("batch-list").querySelector("img").src, `${prefix}/images/annotated.jpg`);
+  app.get("batch-list").children[0].children[1].children[0].listeners.click();
+  assert.equal(app.get("dialog-image").src, `${prefix}/images/annotated.jpg`);
+  assert.equal(app.get("export-link").href, `${prefix}/api/sessions/saved-session/export.csv`);
+  app.state.targets.push({ file: { name: "another.jpg" }, url: "blob:upload" });
+  app.render();
+  assert.equal(app.get("next-queue").querySelector("img").src, "blob:upload");
+  await app.uploadBatch();
+  assert.ok(calls.some(([url, method]) => url === `${prefix}/api/sessions/saved-session/batches` && method === "POST"));
+  assert.ok(calls.some(([url]) => url === `${prefix}/api/sessions/saved-session`), "polling reads the configured backend");
+  await app.finishCount();
+  assert.ok(calls.some(([url, method]) => url === `${prefix}/api/sessions/saved-session/finish` && method === "POST"));
+
+  const restored = browser(async (path) => { calls.push([path, "RESTORE"]); return response(saved); },
+    "saved-session", catalog, storage, base);
+  await settle();
+  assert.equal(restored.state.session.id, "saved-session");
+  assert.ok(calls.some(([url, method]) => url === `${prefix}/api/sessions/saved-session` && method === "RESTORE"));
+  assert.equal(restored.get("batch-list").querySelector("img").src, `${prefix}/images/annotated.jpg`);
+});
+
+test("an invalid backend address leaves counting unavailable with a plain-language message", async () => {
+  let calls = 0;
+  const app = browser(async () => { calls++; return response(session()); }, null, catalog, new Map(), "ftp://count.example");
+  await settle();
+  assert.equal(calls, 0);
+  assert.equal(app.get("start-button").disabled, true);
+  assert.match(app.get("notice").textContent, /app setup/);
 });
 
 test("model selection applies each model's default confidence", async () => {
