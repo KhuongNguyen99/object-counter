@@ -36,10 +36,14 @@ async function waitForCards(page, count) {
   await page.waitForFunction((expected) => document.querySelectorAll(".result-card").length === expected, count, { timeout: 30000 });
 }
 
-async function clearSuggestedBoxes(page) {
-  await page.waitForFunction(() => !document.querySelector("#start-button").disabled &&
-    document.querySelector("#auto-detect-boxes").textContent !== "Detecting…", null, { timeout: 240000 });
-  while (await page.locator("#box-list button").count()) await page.locator("#box-list button").first().click();
+async function clearSuggestedBoxes(page, detection) {
+  const response = await detection;
+  assert.equal(response.status(), 200, `Automatic reference boxes: ${await response.text()}`);
+  await page.waitForFunction(() => document.querySelector("#auto-detect-boxes").getAttribute("aria-busy") !== "true", null, { timeout: 240000 });
+  while (await page.locator(".reference-box-remove").count()) {
+    await page.locator(".reference-box-remove").first().click();
+  }
+  assert.equal(await page.locator(".reference-box-marker").count(), 0, "automatic selections cleared");
 }
 
 async function noHorizontalOverflow(page, label) {
@@ -84,19 +88,25 @@ async function desktopFlow(browser) {
     await page.locator('#model-select option[value="yoloe-26n-seg"]').waitFor({ state: "attached" });
     assert.equal(await page.locator("#model-select").inputValue(), "countgd-plusplus", "CountGD++ is the default trial model");
     assert.equal(await page.locator("#confidence").inputValue(), "0.23", "CountGD++ uses its official threshold");
-    assert.equal(await page.locator("#model-select option").count(), 6, "CountGD++ and all five YOLOE models appear");
+    const catalogIds = await page.locator("#model-select option").evaluateAll((options) => options.map((option) => option.value));
+    for (const id of ["countgd-plusplus", ...["n", "s", "m", "l", "x"].map((size) => `yoloe-26${size}-seg`)]) {
+      assert.ok(catalogIds.includes(id), `${id} appears in the model catalog`);
+    }
     await page.screenshot({ path: path.join(results, "desktop-initial.png"), fullPage: true });
     report.desktop.initialOverflow = await noHorizontalOverflow(page, "desktop setup");
 
-    await page.locator("#object-label").fill("People");
     await page.locator("#model-select").selectOption("yoloe-26n-seg");
+    await page.locator("#object-label").fill("People");
+    const referenceDetection = page.waitForResponse((response) => response.url().endsWith("/api/reference-boxes") &&
+      response.request().method() === "POST", { timeout: 240000 });
     await page.locator("#reference-gallery").setInputFiles(bus);
     await page.locator("#reference-editor").waitFor({ state: "visible" });
-    await clearSuggestedBoxes(page);
+    await clearSuggestedBoxes(page, referenceDetection);
     await page.locator(".coordinate-entry summary").click();
     for (const [id, value] of Object.entries({ "box-x1": 48, "box-y1": 398, "box-x2": 244, "box-y2": 902 })) await page.locator(`#${id}`).fill(String(value));
     await page.locator("#add-coordinate-box").click();
-    assert.equal(await page.locator("#box-overlay rect").count(), 1, "reference box is visible");
+    assert.equal(await page.locator(".reference-box-marker").count(), 1, "manual reference box is selected");
+    assert.deepEqual(JSON.parse(await page.locator(".reference-box-marker").getAttribute("data-box")), [48, 398, 244, 902], "selected reference overlay matches manual coordinates");
     await page.locator("#target-gallery").setInputFiles([bus, mirror]);
     await page.waitForFunction(() => document.querySelectorAll("#target-queue .queue-item").length === 2);
     await page.screenshot({ path: path.join(results, "desktop-ready.png"), fullPage: true });
@@ -182,11 +192,13 @@ async function mobileFlow(browser) {
     await page.locator('#model-select option[value="yoloe-26n-seg"]').waitFor({ state: "attached" });
     report.mobile.initialOverflow = await noHorizontalOverflow(page, "mobile setup");
     await page.screenshot({ path: path.join(results, "mobile-initial.png"), fullPage: true });
-    await page.locator("#object-label").fill("P".repeat(80));
     await page.locator("#model-select").selectOption("yoloe-26n-seg");
+    await page.locator("#object-label").fill("P".repeat(80));
+    const referenceDetection = page.waitForResponse((response) => response.url().endsWith("/api/reference-boxes") &&
+      response.request().method() === "POST", { timeout: 240000 });
     await page.locator("#reference-gallery").setInputFiles(longReference);
     await page.locator("#reference-editor").waitFor({ state: "visible" });
-    await clearSuggestedBoxes(page);
+    await clearSuggestedBoxes(page, referenceDetection);
     const overlay = page.locator("#box-overlay");
     await overlay.scrollIntoViewIfNeeded();
     const rect = await overlay.boundingBox();
@@ -200,7 +212,7 @@ async function mobileFlow(browser) {
       };
       return { scrollY: window.scrollY, overlay: bounds("box-overlay"), image: bounds("editor-image"),
         noticeHidden: document.getElementById("notice").hidden, notice: bounds("notice"),
-        boxCount: document.querySelectorAll("#box-overlay rect:not(.draft)").length };
+        boxCount: document.querySelectorAll(".reference-box-marker").length };
     });
     const beforeTouch = await touchGeometry();
     const scrollBefore = beforeTouch.scrollY;
@@ -212,9 +224,12 @@ async function mobileFlow(browser) {
     }
     const afterLastMove = await touchGeometry();
     await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
-    await page.waitForFunction(() => document.querySelectorAll("#box-overlay rect").length === 1);
+    await page.waitForFunction(() => document.querySelectorAll(".reference-box-marker").length === 1);
     const afterCompletion = await touchGeometry();
-    const touchBox = await overlay.locator("rect").first().evaluate((element) => ["x", "y", "width", "height"].map((name) => Number(element.getAttribute(name))));
+    const touchBox = await page.locator(".reference-box-marker").evaluate((marker) => {
+      const [x1, y1, x2, y2] = JSON.parse(marker.dataset.box);
+      return [x1, y1, x2 - x1, y2 - y1];
+    });
     const diagnostic = { start, end, beforeTouch, afterLastMove, afterCompletion, touchBox };
     const diagnosticDir = path.join(results, "reference-auto/manual-regression");
     fs.mkdirSync(diagnosticDir, { recursive: true });

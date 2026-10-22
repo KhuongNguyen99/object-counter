@@ -25,6 +25,41 @@ def test_dictionary_model_catalog_detects_runtime_device(monkeypatch):
     assert catalog["default_model"] == "countgd-plusplus"
 
 
+@pytest.mark.parametrize("countgd_available", [True, False])
+def test_production_catalog_only_exposes_countgd_even_with_other_models(tmp_path, monkeypatch,
+                                                                         countgd_available):
+    from app import models as model_module
+
+    monkeypatch.setattr(model_module, "list_models", lambda: [
+        {"id": "sam3", "available": True},
+        {"id": "yoloe-26s-seg", "available": True},
+        {"id": "countgd-plusplus", "available": countgd_available,
+         "reference_mode": "per_image", "required_reference_boxes": 10,
+         "default_confidence": .80},
+    ])
+    monkeypatch.setattr(main_module, "_device", lambda _: "cpu")
+    with TestClient(create_app(tmp_path)) as client:
+        catalog = client.get("/api/models").json()
+        assert catalog["default_model"] == "countgd-plusplus"
+        assert [model["id"] for model in catalog["models"]] == ["countgd-plusplus"]
+        assert catalog["models"][0]["available"] == countgd_available
+        rejected = client.post("/api/sessions", data={"model": "sam3"})
+        assert rejected.status_code == 422
+        assert rejected.json()["detail"] == "Counting is unavailable right now. Please try again."
+        if countgd_available:
+            created = client.post("/api/sessions", data={"model": "countgd-plusplus"})
+            assert created.status_code == 201, created.text
+            assert created.json()["confidence"] == .80
+            monkeypatch.setattr(model_module, "list_models", lambda: [
+                {"id": "countgd-plusplus", "available": False,
+                 "reference_mode": "per_image", "required_reference_boxes": 10},
+            ])
+            blocked = new_batch(client, created.json()["id"], ("target.png", png("blue")))
+            assert blocked.status_code == 422
+        else:
+            assert client.post("/api/sessions", data={"model": "countgd-plusplus"}).status_code == 422
+
+
 MODELS = [{"id": "yoloe-26s-seg", "name": "YOLOE-26 Small", "family": "YOLOE-26",
            "size": "s", "available": True, "bytes": 100}]
 
@@ -40,7 +75,7 @@ def upload(name, data):
 
 
 def proposal_request(client, name, data, label="rings"):
-    return client.post("/api/reference-boxes", data={"label": label},
+    return client.post("/api/reference-boxes", data={} if label is None else {"label": label},
                        files={"image": upload(name, data)})
 
 
@@ -48,6 +83,7 @@ class FakeEngine:
     def __init__(self):
         self.fail_next = False
         self.calls = []
+        self.reference_modes = []
         self.labels = []
         self.result_count = 1
         self.warning = None
@@ -66,11 +102,13 @@ class FakeEngine:
             width, height = image.size
         return self.proposal if self.proposal is not None else {
             "width": width, "height": height, "boxes": [[1, 1, width - 1, height - 1]],
-            "model": "countgd-plusplus", "elapsed_ms": 3.5, "warning": None,
+            "model": "fastsam-s", "elapsed_ms": 3.5, "warning": None,
         }
 
-    def count(self, model_id, references, image_paths, output_dir, confidence, label=""):
+    def count(self, model_id, references, image_paths, output_dir, confidence, label="",
+              reference_mode="shared"):
         self.calls.append((model_id, references, image_paths, confidence))
+        self.reference_modes.append(reference_mode)
         self.labels.append(label)
         if self.fail_next:
             self.fail_next = False
@@ -114,6 +152,67 @@ def settled(client, session_id, batch_id):
     raise AssertionError("batch did not finish")
 
 
+def test_historical_legacy_count_is_readable_but_cannot_start_another_batch(tmp_path, monkeypatch):
+    from app import models as model_module
+
+    with TestClient(create_app(tmp_path, FakeEngine, lambda: MODELS)) as client:
+        created = new_session(client)
+        assert created.status_code == 201, created.text
+        session_id = created.json()["id"]
+        batch = new_batch(client, session_id, ("target.png", png("blue")))
+        assert batch.status_code == 202, batch.text
+        assert settled(client, session_id, batch.json()["id"])[1]["status"] == "complete"
+
+    monkeypatch.setattr(model_module, "list_models", lambda: [
+        {"id": "countgd-plusplus", "available": True,
+         "reference_mode": "per_image", "required_reference_boxes": 10},
+        *MODELS,
+    ])
+    with TestClient(create_app(tmp_path, FakeEngine)) as client:
+        saved = client.get(f"/api/sessions/{session_id}")
+        assert saved.status_code == 200
+        assert saved.json()["model"] == "yoloe-26s-seg"
+        assert saved.json()["total_count"] == 1
+        assert saved.json()["batches"][0]["results"][0]["count"] == 1
+        assert new_batch(client, session_id, ("new.png", png("green"))).status_code == 422
+
+
+@pytest.mark.parametrize("model", ["yoloe-26s-seg", "pet-dino-swin-t"])
+@pytest.mark.parametrize("label", [None, "", "   "])
+def test_reference_models_count_with_optional_description(tmp_path, model, label):
+    engine = FakeEngine()
+    models = [{"id": model, "available": True}]
+    data = {"model": model, "reference_boxes": "[[[1,1,9,9]]]"}
+    if label is not None:
+        data["label"] = label
+    with TestClient(create_app(tmp_path, lambda: engine, lambda: models)) as client:
+        created = client.post("/api/sessions", data=data,
+                              files=[("references", upload("ref.png", png("red")))])
+        assert created.status_code == 201
+        session_id = created.json()["id"]
+        assert created.json()["label"] == ""
+        batch = new_batch(client, session_id, ("target.png", png("blue"))).json()
+        restored, result = settled(client, session_id, batch["id"])
+        assert result["status"] == "complete" and restored["total_count"] == 1
+        assert restored["label"] == "" and engine.labels == [""]
+
+
+@pytest.mark.parametrize("label", [None, "", "   "])
+def test_text_only_model_requires_description(tmp_path, label):
+    models = [{"id": "sam3count", "available": True, "reference_mode": "none"}]
+    data = {"model": "sam3count"}
+    if label is not None:
+        data["label"] = label
+    with TestClient(create_app(tmp_path, FakeEngine, lambda: models)) as client:
+        assert client.post("/api/sessions", data=data).status_code == 422
+
+
+@pytest.mark.parametrize("label", ["bad\nlabel", "x" * 81])
+def test_optional_description_still_validates_supplied_text(tmp_path, label):
+    with TestClient(create_app(tmp_path, FakeEngine, lambda: MODELS)) as client:
+        assert new_session(client, name=label).status_code == 422
+
+
 def test_text_only_model_counts_without_references_and_rejects_ignored_uploads(tmp_path):
     engine = FakeEngine()
     models = MODELS + [{"id": "sam3count", "available": True, "reference_mode": "none"}]
@@ -133,6 +232,211 @@ def test_text_only_model_counts_without_references_and_rejects_ignored_uploads(t
         assert client.post("/api/sessions", data={**data, "model": "yoloe-26s-seg"}).status_code == 422
 
 
+def test_sam3_uses_each_target_as_its_own_reference_and_persists_boxes(tmp_path):
+    engine = FakeEngine()
+    models = MODELS + [{"id": "sam3", "available": True, "reference_mode": "per_image"}]
+    boxes = [[[1, 1, 8, 8]] * 20, [[2, 2, 10, 9]] * 20]
+    with TestClient(create_app(tmp_path, lambda: engine, lambda: models)) as client:
+        created = client.post("/api/sessions", data={"model": "sam3"})
+        assert created.status_code == 201, created.text
+        session_id = created.json()["id"]
+        assert created.json()["label"] == "" and created.json()["references"] == []
+        assert client.post("/api/sessions", data={"model": "sam3"},
+                           files=[("references", upload("ref.png", png("red")))]).status_code == 422
+        assert client.post("/api/sessions", data={"model": "sam3",
+                           "reference_boxes": "[[[1,1,8,8]]]"}).status_code == 422
+
+        first = client.post(f"/api/sessions/{session_id}/batches",
+                            data={"image_boxes": json.dumps(boxes)}, files=[
+                                ("images", upload("blue.png", png("blue"))),
+                                ("images", upload("green.png", png("green"))),
+                            ])
+        assert first.status_code == 202, first.text
+        _, batch = settled(client, session_id, first.json()["id"])
+        assert batch["status"] == "complete", batch
+        model_id, references, paths, _ = engine.calls[0]
+        assert model_id == "sam3"
+        assert [ref["path"] for ref in references] == paths
+        assert all(Path(path).is_absolute() for path in paths)
+        assert [ref["boxes"] for ref in references] == boxes
+        assert [result["reference_boxes"] for result in batch["results"]] == boxes
+
+        later_boxes = [[[3, 3, 11, 10]]]
+        later = client.post(f"/api/sessions/{session_id}/batches",
+                            data={"image_boxes": json.dumps(later_boxes)},
+                            files=[("images", upload("yellow.png", png("yellow")))])
+        assert later.status_code == 202, later.text
+        _, later_batch = settled(client, session_id, later.json()["id"])
+        assert later_batch["status"] == "complete"
+        assert len(engine.calls[1][1]) == 1
+        assert engine.calls[1][1][0]["path"] == engine.calls[1][2][0]
+        assert engine.calls[1][1][0]["boxes"] == later_boxes[0]
+
+    with TestClient(create_app(tmp_path, FakeEngine, lambda: models)) as client:
+        restored = client.get(f"/api/sessions/{session_id}").json()
+        assert [[result["reference_boxes"] for result in batch["results"]]
+                for batch in restored["batches"]] == [boxes, later_boxes]
+
+
+def test_countgd_uses_ten_boxes_from_each_photo_across_batches(tmp_path):
+    engine = FakeEngine()
+    models = [{"id": "countgd-plusplus", "available": True, "reference_mode": "per_image",
+               "required_reference_boxes": 10}]
+    boxes = [[[i, 1, i + 4, 5] for i in range(1, 11)],
+             [[i, 2, i + 4, 6] for i in range(1, 11)]]
+    with TestClient(create_app(tmp_path, lambda: engine, lambda: models)) as client:
+        created = client.post("/api/sessions", data={"model": "countgd-plusplus", "label": ""})
+        assert created.status_code == 201, created.text
+        session_id = created.json()["id"]
+        assert created.json()["references"] == []
+        assert created.json()["reference_mode"] == "per_image"
+        assert created.json()["required_reference_boxes"] == 10
+        assert client.post("/api/sessions", data={"model": "countgd-plusplus"},
+                           files=[("references", upload("ref.png", png("red")))]).status_code == 422
+        first = client.post(f"/api/sessions/{session_id}/batches",
+                            data={"image_boxes": json.dumps(boxes)}, files=[
+                                ("images", upload("blue.png", png("blue"))),
+                                ("images", upload("green.png", png("green"))),
+                            ])
+        assert first.status_code == 202, first.text
+        _, batch = settled(client, session_id, first.json()["id"])
+        assert batch["status"] == "complete"
+        assert engine.reference_modes == ["per_image"]
+        assert [ref["path"] for ref in engine.calls[0][1]] == engine.calls[0][2]
+        assert [ref["boxes"] for ref in engine.calls[0][1]] == boxes
+        assert [result["reference_boxes"] for result in batch["results"]] == boxes
+
+        later_boxes = [[[i, 3, i + 4, 7] for i in range(1, 11)]]
+        later = client.post(f"/api/sessions/{session_id}/batches",
+                            data={"image_boxes": json.dumps(later_boxes)},
+                            files=[("images", upload("yellow.png", png("yellow")))])
+        assert later.status_code == 202, later.text
+        assert settled(client, session_id, later.json()["id"])[1]["status"] == "complete"
+        assert len(engine.calls[1][1]) == 1
+        assert engine.calls[1][1][0]["path"] == engine.calls[1][2][0]
+        assert engine.calls[1][1][0]["boxes"] == later_boxes[0]
+
+    with TestClient(create_app(tmp_path, FakeEngine, lambda: models)) as client:
+        restored = client.get(f"/api/sessions/{session_id}").json()
+        assert restored["reference_mode"] == "per_image"
+        assert restored["required_reference_boxes"] == 10
+        assert [[result["reference_boxes"] for result in batch["results"]]
+                for batch in restored["batches"]] == [boxes, later_boxes]
+
+
+@pytest.mark.parametrize("boxes", [
+    [[i, 1, i + 4, 5] for i in range(1, 10)],
+    [[i, 1, i + 4, 5] for i in range(1, 12)],
+    [[1, 1, 8, 8]] * 10,
+])
+def test_countgd_rejects_wrong_or_duplicate_boxes_before_queue(tmp_path, boxes):
+    engine = FakeEngine()
+    models = [{"id": "countgd-plusplus", "available": True, "reference_mode": "per_image",
+               "required_reference_boxes": 10}]
+    with TestClient(create_app(tmp_path, lambda: engine, lambda: models)) as client:
+        session_id = client.post("/api/sessions", data={"model": "countgd-plusplus"}).json()["id"]
+        rejected = client.post(f"/api/sessions/{session_id}/batches",
+                               data={"image_boxes": json.dumps([boxes])},
+                               files=[("images", upload("target.png", png("blue")))])
+        assert rejected.status_code == 422
+        assert "exactly 10 distinct" in rejected.json()["detail"]
+        assert engine.calls == []
+        assert client.get(f"/api/sessions/{session_id}").json()["batches"] == []
+        assert list((tmp_path / session_id / "files").iterdir()) == []
+
+
+def test_legacy_countgd_session_keeps_shared_reference_batches(tmp_path):
+    engine = FakeEngine()
+    models = [{"id": "countgd-plusplus", "available": True, "reference_mode": "per_image",
+               "required_reference_boxes": 10}]
+    app = create_app(tmp_path, lambda: engine, lambda: models)
+    session_id = "legacy-countgd-session"
+    files_dir = tmp_path / session_id / "files"
+    files_dir.mkdir(parents=True)
+    (files_dir / "reference-old.jpg").write_bytes(png("red"))
+    app.state.store.create_session(session_id, "rings", "countgd-plusplus", .25, [{
+        "id": "legacy-ref", "filename": "reference-old.jpg", "width": 16, "height": 12,
+        "boxes": [[1, 1, 8, 8]],
+    }])
+    with TestClient(app) as client:
+        saved = client.get(f"/api/sessions/{session_id}").json()
+        assert saved["reference_mode"] == "shared"
+        assert saved["required_reference_boxes"] is None
+        first = new_batch(client, session_id, ("blue.png", png("blue")))
+        assert first.status_code == 202, first.text
+        assert settled(client, session_id, first.json()["id"])[1]["status"] == "complete"
+        second = new_batch(client, session_id, ("green.png", png("green")))
+        assert second.status_code == 202, second.text
+        assert settled(client, session_id, second.json()["id"])[1]["status"] == "complete"
+        assert engine.reference_modes == ["shared", "shared"]
+        assert all(call[1][0]["boxes"] == [[1, 1, 8, 8]] for call in engine.calls)
+        assert all(call[1][0]["path"] == str(files_dir / "reference-old.jpg") for call in engine.calls)
+
+
+@pytest.mark.parametrize("image_boxes", [
+    None, "", "invalid", "null", "{}", "[]", "[[]]", "[[1,2,3,4]]",
+    "[[[true,1,8,8]]]", "[[[NaN,1,8,8]]]", "[[[Infinity,1,8,8]]]",
+    "[[[-1,1,8,8]]]", "[[[1,1,17,8]]]", "[[[8,1,1,8]]]",
+    json.dumps([[[1, 1, 10 ** 400, 8]]]),
+    json.dumps([[[1, 1, 8, 8]] * 33]),
+])
+def test_sam3_rejects_bad_target_boxes_without_files_or_queue(tmp_path, image_boxes):
+    models = [{"id": "sam3", "available": True, "reference_mode": "per_image"}]
+    with TestClient(create_app(tmp_path, FakeEngine, lambda: models)) as client:
+        session_id = client.post("/api/sessions", data={"model": "sam3"}).json()["id"]
+        data = {} if image_boxes is None else {"image_boxes": image_boxes}
+        response = client.post(f"/api/sessions/{session_id}/batches", data=data,
+                               files=[("images", upload("target.png", png("blue")))])
+        assert response.status_code == 422, response.text
+        assert client.get(f"/api/sessions/{session_id}").json()["batches"] == []
+        assert list((tmp_path / session_id / "files").iterdir()) == []
+        valid = client.post(f"/api/sessions/{session_id}/batches",
+                            data={"image_boxes": "[[[1,1,8,8]]]"},
+                            files=[("images", upload("target.png", png("blue")))])
+        assert valid.status_code == 202, valid.text
+        assert settled(client, session_id, valid.json()["id"])[1]["status"] == "complete"
+
+
+def test_sam3_boxes_use_exif_normalized_target_dimensions(tmp_path):
+    models = [{"id": "sam3", "available": True, "reference_mode": "per_image"}]
+    engine = FakeEngine()
+    exif = Image.Exif()
+    exif[274] = 6
+    source = io.BytesIO()
+    Image.new("RGB", (10, 6), "red").save(source, format="JPEG", exif=exif)
+    with TestClient(create_app(tmp_path, lambda: engine, lambda: models)) as client:
+        session_id = client.post("/api/sessions", data={"model": "sam3"}).json()["id"]
+        endpoint = f"/api/sessions/{session_id}/batches"
+        rejected = client.post(endpoint, data={"image_boxes": "[[[1,1,9,5]]]"},
+                               files=[("images", upload("rotated.jpg", source.getvalue()))])
+        assert rejected.status_code == 422
+        accepted = client.post(endpoint, data={"image_boxes": "[[[1,1,5,9]]]"},
+                               files=[("images", upload("rotated.jpg", source.getvalue()))])
+        assert accepted.status_code == 202, accepted.text
+        assert settled(client, session_id, accepted.json()["id"])[1]["status"] == "complete"
+        with Image.open(engine.calls[0][2][0]) as normalized:
+            assert normalized.size == (6, 10)
+
+
+@pytest.mark.parametrize("model,reference_mode", [
+    ("yoloe-26s-seg", None), ("sam3count", "none"),
+])
+def test_other_models_reject_per_image_boxes(tmp_path, model, reference_mode):
+    models = MODELS + [{"id": "sam3count", "available": True, "reference_mode": "none"}]
+    with TestClient(create_app(tmp_path, FakeEngine, lambda: models)) as client:
+        if reference_mode == "none":
+            session_id = client.post("/api/sessions", data={"model": model,
+                "label": "rings"}).json()["id"]
+        else:
+            session_id = new_session(client).json()["id"]
+        rejected = client.post(f"/api/sessions/{session_id}/batches",
+                               data={"image_boxes": "[[[1,1,8,8]]]"},
+                               files=[("images", upload("target.png", png("blue")))])
+        assert rejected.status_code == 422
+        assert client.get(f"/api/sessions/{session_id}").json()["batches"] == []
+        assert len(list((tmp_path / session_id / "files").iterdir())) == (0 if reference_mode else 1)
+
+
 def test_reference_boxes_normalizes_exif_and_cleans_temp_file(tmp_path):
     engine = FakeEngine()
     app = create_app(tmp_path, engine_factory=lambda: engine, model_lister=lambda: MODELS)
@@ -144,7 +448,7 @@ def test_reference_boxes_normalizes_exif_and_cleans_temp_file(tmp_path):
         response = proposal_request(client, "photo.jpg", source.getvalue(), "  red rings  ")
     assert response.status_code == 200, response.text
     assert response.json() == {"width": 6, "height": 10, "boxes": [[1, 1, 5, 9]],
-                               "model": "countgd-plusplus", "elapsed_ms": 3.5, "warning": None}
+                               "model": "fastsam-s", "elapsed_ms": 3.5, "warning": None}
     assert len(engine.suggest_calls) == 1
     assert engine.suggest_labels == ["red rings"]
     assert not Path(engine.suggest_calls[0]).exists()
@@ -153,12 +457,12 @@ def test_reference_boxes_normalizes_exif_and_cleans_temp_file(tmp_path):
 
 @pytest.mark.parametrize("proposal", [
     {"width": 16, "height": 12, "boxes": [[0, 0, 17, 2]],
-     "model": "countgd-plusplus", "elapsed_ms": 1, "warning": None},
+     "model": "fastsam-s", "elapsed_ms": 1, "warning": None},
     {"width": 16, "height": 12, "boxes": [[0, 0, float("nan"), 2]],
-     "model": "countgd-plusplus", "elapsed_ms": 1, "warning": None},
-    {"width": 16, "height": 12, "boxes": [[1, 1, 2, 2]] * 33,
-     "model": "countgd-plusplus", "elapsed_ms": 1, "warning": None},
+     "model": "fastsam-s", "elapsed_ms": 1, "warning": None},
     {"width": 12, "height": 16, "boxes": [],
+     "model": "fastsam-s", "elapsed_ms": 1, "warning": None},
+    {"width": 16, "height": 12, "boxes": [[1, 1, 2, 2]],
      "model": "countgd-plusplus", "elapsed_ms": 1, "warning": None},
 ])
 def test_reference_boxes_rejects_invalid_detector_output(tmp_path, proposal):
@@ -198,13 +502,23 @@ def test_reference_boxes_bad_image_limits_and_model_failure(tmp_path, monkeypatc
         assert proposal_request(client, "wide.png", png("red")).status_code == 422
 
 
-@pytest.mark.parametrize("label", ["", "  ", "bad\nlabel", "x" * 81])
+@pytest.mark.parametrize("label", [None, "", "  ", "  rings  "])
+def test_reference_boxes_accepts_optional_description(tmp_path, label):
+    engine = FakeEngine()
+    app = create_app(tmp_path, engine_factory=lambda: engine, model_lister=lambda: MODELS)
+    with TestClient(app) as client:
+        response = proposal_request(client, "photo.png", png("red"), label)
+    assert response.status_code == 200
+    assert response.json()["model"] == "fastsam-s"
+    assert engine.suggest_labels == [label.strip() if label is not None else ""]
+
+
+@pytest.mark.parametrize("label", ["bad\nlabel", "x" * 81])
 def test_reference_boxes_rejects_invalid_label(tmp_path, label):
     engine = FakeEngine()
     app = create_app(tmp_path, engine_factory=lambda: engine, model_lister=lambda: MODELS)
     with TestClient(app) as client:
         assert proposal_request(client, "photo.png", png("red"), label).status_code == 422
-        assert client.post("/api/reference-boxes", files={"image": upload("photo.png", png("red"))}).status_code == 422
     assert engine.suggest_calls == []
 
 
@@ -247,7 +561,7 @@ def test_cancelled_reference_request_keeps_temp_and_slot_until_worker_finishes(t
             started.set()
             assert release.wait(5)
             assert Path(image_path).exists()
-            return {"width": 16, "height": 12, "boxes": [], "model": "countgd-plusplus",
+            return {"width": 16, "height": 12, "boxes": [], "model": "fastsam-s",
                     "elapsed_ms": 1, "warning": "No objects found"}
 
     engine = BlockingEngine()
@@ -527,3 +841,20 @@ def test_body_limit_checks_content_length_and_stream(monkeypatch):
         assert client.post("/consume", content=b"x" * 129).status_code == 413
         streamed = client.post("/consume", content=iter([b"x" * 80, b"x" * 80]))
         assert streamed.status_code == 413
+
+
+def test_reference_proposal_api_accepts_more_than_32_and_validates_every_box(tmp_path):
+    engine = FakeEngine()
+    boxes = [[1 + (i % 10) * 8, 1 + (i // 10) * 8,
+              5 + (i % 10) * 8, 5 + (i // 10) * 8] for i in range(40)]
+    engine.proposal = {"width": 100, "height": 80, "boxes": boxes,
+                       "model": "fastsam-s", "elapsed_ms": 1, "warning": None}
+    with TestClient(create_app(tmp_path, engine_factory=lambda: engine, model_lister=lambda: MODELS)) as client:
+        source = io.BytesIO()
+        Image.new("RGB", (100, 80), "gray").save(source, format="PNG")
+        response = proposal_request(client, "photo.png", source.getvalue())
+        assert response.status_code == 200, response.text
+        assert response.json()["boxes"] == boxes
+        engine.proposal["boxes"] = boxes[:32] + [[1, 1, 101, 10]]
+        rejected = proposal_request(client, "photo.png", source.getvalue())
+        assert rejected.status_code == 500

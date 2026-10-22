@@ -17,13 +17,15 @@ from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps, UnidentifiedImageError
 from starlette.concurrency import run_in_threadpool
 
 from app.storage import Store
+from app.models import COUNTGD_MODEL_ID, SAM3COUNT_MODEL_ID, SAM3_MODEL_ID
+from app.quick_count import count_marked_areas, parse_search_areas
 
 
 logger = logging.getLogger(__name__)
@@ -34,7 +36,15 @@ MAX_REFERENCES = 8
 MAX_TARGETS = 20
 MAX_BOXES = 32
 MAX_QUEUE = 8
-DEFAULT_MODEL = "yoloe-26s-seg"
+DEFAULT_MODEL = COUNTGD_MODEL_ID
+LEGACY_REFERENCE_MODES = {SAM3_MODEL_ID: "per_image", SAM3COUNT_MODEL_ID: "none"}
+
+
+class RevalidatingStaticFiles(StaticFiles):
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
 
 
 class BodyLimitMiddleware:
@@ -95,10 +105,12 @@ def _safe_filename(value):
     return name[:180] or "image"
 
 
-def _validate_label(value):
+def _validate_label(value, *, required=True):
     label = value.strip()
-    if not label or len(label) > 80 or not all(char.isprintable() for char in label):
-        raise HTTPException(422, "Label must be 1–80 printable characters")
+    if required and not label:
+        raise HTTPException(422, "Describe the object before continuing")
+    if len(label) > 80 or not all(char.isprintable() for char in label):
+        raise HTTPException(422, "Object description must be at most 80 printable characters")
     return label
 
 
@@ -130,26 +142,32 @@ def _normalize_image(data: bytes, destination: Path):
         raise HTTPException(422, "Unreadable image; use a valid JPEG, PNG, or WebP") from exc
 
 
-def _parse_boxes(raw, dimensions):
+def _parse_boxes(raw, dimensions, *, per_image=False):
+    field = "image_boxes" if per_image else "reference_boxes"
     try:
         groups = json.loads(raw)
     except (TypeError, ValueError) as exc:
-        raise HTTPException(422, "reference_boxes must be valid JSON") from exc
+        raise HTTPException(422, f"{field} must be valid JSON") from exc
     if not isinstance(groups, list) or len(groups) != len(dimensions):
-        raise HTTPException(422, "Provide one box group for each reference image")
-    if sum(len(group) for group in groups if isinstance(group, list)) > MAX_BOXES:
+        kind = "target" if per_image else "reference"
+        raise HTTPException(422, f"Provide one box group for each {kind} image")
+    if not per_image and sum(len(group) for group in groups if isinstance(group, list)) > MAX_BOXES:
         raise HTTPException(422, "Use at most 32 reference boxes")
     for group, (width, height) in zip(groups, dimensions):
-        if not isinstance(group, list) or not group:
+        if not isinstance(group, list) or not group or (per_image and len(group) > MAX_BOXES):
+            if per_image:
+                raise HTTPException(422, "Each target image needs 1–32 boxes")
             raise HTTPException(422, "Each reference image needs at least one box")
         for box in group:
             if (not isinstance(box, list) or len(box) != 4 or
-                    any(isinstance(n, bool) or not isinstance(n, (int, float)) or not math.isfinite(n)
+                    any(isinstance(n, bool) or not isinstance(n, (int, float)) or
+                        (isinstance(n, float) and not math.isfinite(n))
                         for n in box)):
                 raise HTTPException(422, "Each box needs four finite pixel coordinates")
             x1, y1, x2, y2 = box
             if not (0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height):
-                raise HTTPException(422, "Reference boxes must fit inside their image")
+                kind = "Target" if per_image else "Reference"
+                raise HTTPException(422, f"{kind} boxes must fit inside their image")
     return groups
 
 
@@ -170,7 +188,7 @@ def _model_catalog(model_lister, detect_device=False):
         default = catalog.get("default_model", DEFAULT_MODEL)
         device = catalog.get("device") or (_device(os.environ.get("DEVICE", "auto")) if detect_device else "cpu")
     else:
-        models, default = catalog, DEFAULT_MODEL
+        models, default = catalog, (catalog[0]["id"] if catalog else DEFAULT_MODEL)
         device = _device(os.environ.get("DEVICE", "auto")) if detect_device else "cpu"
     return {"models": models, "default_model": default, "device": device}
 
@@ -198,11 +216,11 @@ def _validate_reference_proposal(value, width, height):
     warning = value.get("warning")
     if (type(value.get("width")) is not int or value["width"] != width or
             type(value.get("height")) is not int or value["height"] != height or
-            value.get("model") != "countgd-plusplus" or
+            value.get("model") != "fastsam-s" or
             isinstance(elapsed, bool) or not isinstance(elapsed, (int, float)) or
             not math.isfinite(elapsed) or elapsed < 0 or
             (warning is not None and not isinstance(warning, str)) or
-            not isinstance(boxes, list) or len(boxes) > MAX_BOXES):
+            not isinstance(boxes, list)):
         raise ValueError("The detector returned invalid reference boxes")
     for box in boxes:
         if (not isinstance(box, list) or len(box) != 4 or
@@ -213,7 +231,7 @@ def _validate_reference_proposal(value, width, height):
         if not (0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height):
             raise ValueError("The detector returned invalid reference boxes")
     return {"width": width, "height": height, "boxes": boxes,
-            "model": "countgd-plusplus", "elapsed_ms": elapsed,
+            "model": "fastsam-s", "elapsed_ms": elapsed,
             "warning": warning[:500] if warning else None}
 
 
@@ -227,11 +245,9 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None):
     detect_device = model_lister is None
     if model_lister is None:
         def model_lister():
-            from app.models import COUNTGD_MODEL_ID, list_models
-            catalog = list_models()
-            preferred = COUNTGD_MODEL_ID if any(entry["id"] == COUNTGD_MODEL_ID and entry["available"]
-                                               for entry in catalog) else DEFAULT_MODEL
-            return {"models": catalog, "default_model": preferred}
+            from app.models import list_models
+            catalog = [entry for entry in list_models() if entry["id"] == COUNTGD_MODEL_ID]
+            return {"models": catalog, "default_model": COUNTGD_MODEL_ID}
 
     if engine_factory is None:
         def engine_factory():
@@ -253,9 +269,18 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None):
         result = store.detail(session_id)
         if result is None:
             raise HTTPException(404, "Session not found")
+        if result["model"] == COUNTGD_MODEL_ID:
+            result["reference_mode"] = "shared" if result["references"] else "per_image"
+            result["required_reference_boxes"] = 10 if not result["references"] else None
+        else:
+            entry = next((entry for entry in _model_catalog(model_lister, detect_device)["models"]
+                          if entry["id"] == result["model"]), {})
+            result["reference_mode"] = entry.get(
+                "reference_mode", LEGACY_REFERENCE_MODES.get(result["model"], "shared"))
+            result["required_reference_boxes"] = entry.get("required_reference_boxes")
         return result
 
-    def run_batch(session_id, batch_id, items):
+    def run_batch(session_id, batch_id, items, per_image, count_mode):
         nonlocal engine
         session_dir = data_dir / session_id
         files_dir = session_dir / "files"
@@ -263,18 +288,29 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None):
         created = []
         try:
             store.set_batch_status(batch_id, "running")
-            refs = detail_or_404(session_id)["references"]
-            references = [{"path": str(files_dir / ref["filename"]), "boxes": ref["boxes"]}
-                          for ref in refs]
             output_dir.mkdir(parents=True, exist_ok=True)
             if engine is None:
                 engine = engine_factory()
             session = store.session_row(session_id)
-            output = engine.count(
-                model_id=session["model"], references=references,
-                image_paths=[str(files_dir / item["original_filename"]) for item in items],
-                output_dir=str(output_dir), confidence=session["confidence"], label=session["label"],
-            )
+            if count_mode == "quick":
+                output = [count_marked_areas(
+                    engine, str(files_dir / item["original_filename"]), item["search_areas"],
+                    output_dir, session["label"], _validate_reference_proposal) for item in items]
+            else:
+                if per_image:
+                    references = [{"path": str(files_dir / item["original_filename"]),
+                                   "boxes": item["reference_boxes"]} for item in items]
+                else:
+                    refs = detail_or_404(session_id)["references"]
+                    references = [{"path": str(files_dir / ref["filename"]), "boxes": ref["boxes"]}
+                                  for ref in refs]
+                options = {"reference_mode": "per_image"} if per_image and session["model"] == COUNTGD_MODEL_ID else {}
+                output = engine.count(
+                    model_id=session["model"], references=references,
+                    image_paths=[str(files_dir / item["original_filename"]) for item in items],
+                    output_dir=str(output_dir), confidence=session["confidence"], label=session["label"],
+                    **options,
+                )
             if not isinstance(output, list) or len(output) != len(items):
                 raise ValueError("The model returned the wrong number of image results")
             results = []
@@ -307,6 +343,7 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None):
                     "height": height, "elapsed_ms": elapsed_ms,
                     "warning": str(result["warning"])[:500] if result.get("warning") else None,
                     "processing": processing,
+                    "verification": result.get("verification"),
                 })
             store.complete_batch(batch_id, results)
         except Exception as exc:
@@ -324,15 +361,22 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None):
     def health():
         return {"status": "ok"}
 
+    @app.get("/reports/reliability.html", include_in_schema=False)
+    def reliability_report():
+        report = data_dir / "reports" / "reliability.html"
+        if not report.is_file():
+            raise HTTPException(404, "No benchmark report has been generated")
+        return FileResponse(report, media_type="text/html")
+
     @app.get("/api/models")
     def models():
         return _model_catalog(model_lister, detect_device)
 
     @app.post("/api/reference-boxes")
-    async def reference_boxes(image: UploadFile = File(...), label: str = Form(...)):
+    async def reference_boxes(image: UploadFile = File(...), label: str = Form("")):
         from app.reference import ReferenceModelUnavailable
 
-        label = _validate_label(label)
+        label = _validate_label(label, required=False)
         data = await image.read(MAX_FILE_BYTES + 1)
         if len(data) > MAX_FILE_BYTES:
             raise HTTPException(413, "Each image must be 20 MB or smaller")
@@ -370,20 +414,23 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None):
 
     @app.post("/api/sessions", status_code=201)
     async def create_session(
-        label: str = Form(...), references: list[UploadFile] = File(default=[]),
-        model: str = Form(...), confidence: float = Form(.25),
+        label: str = Form(""), references: list[UploadFile] = File(default=[]),
+        model: str = Form(...), confidence: float = Form(.80),
         reference_boxes: str = Form("[]"),
     ):
-        label = _validate_label(label)
         if not math.isfinite(confidence) or not .01 <= confidence <= .95:
             raise HTTPException(422, "Confidence must be between 0.01 and 0.95")
         available = {entry["id"]: entry for entry in _model_catalog(model_lister, detect_device)["models"]
                      if entry.get("available")}
         if model not in available:
-            raise HTTPException(422, "Choose an available model")
-        if available[model].get("reference_mode") == "none":
+            raise HTTPException(422, "Counting is unavailable right now. Please try again.")
+        reference_mode = "per_image" if model == COUNTGD_MODEL_ID else available[model].get("reference_mode")
+        label = _validate_label(label, required=reference_mode == "none")
+        if reference_mode in {"none", "per_image"}:
             if references:
-                raise HTTPException(422, "This model uses the Object description; do not upload reference images")
+                detail = ("This model uses the Object description; do not upload reference images"
+                          if reference_mode == "none" else "This model does not use separate reference images")
+                raise HTTPException(422, detail)
         elif not 1 <= len(references) <= MAX_REFERENCES:
             raise HTTPException(422, "Upload 1–8 reference images")
         session_id = _id()
@@ -410,11 +457,40 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None):
         return detail_or_404(session_id)
 
     @app.post("/api/sessions/{session_id}/batches", status_code=202)
-    async def create_batch(session_id: str, images: list[UploadFile] = File(...)):
-        if store.session_row(session_id) is None:
+    async def create_batch(session_id: str, images: list[UploadFile] = File(...),
+                           image_boxes: str = Form("[]"), count_mode: str = Form("standard"),
+                           search_areas: str = Form("[]")):
+        session = store.session_row(session_id)
+        if session is None:
             raise HTTPException(404, "Session not found")
         if not 1 <= len(images) <= MAX_TARGETS:
             raise HTTPException(422, "Upload 1–20 target images")
+        saved = detail_or_404(session_id)
+        available_models = {entry["id"] for entry in _model_catalog(model_lister, detect_device)["models"]
+                            if entry.get("available")}
+        if detect_device and (session["model"] not in available_models or
+                              saved["reference_mode"] != "per_image"):
+            raise HTTPException(422, "This session can no longer accept new counts")
+        per_image = saved["reference_mode"] == "per_image"
+        if count_mode not in {"standard", "quick"}:
+            raise HTTPException(422, "Choose standard or Quick count")
+        if count_mode == "quick" and session["model"] != COUNTGD_MODEL_ID:
+            raise HTTPException(422, "Quick count is available for CountGD++ sessions")
+        if count_mode == "quick" or not per_image:
+            try:
+                unused_boxes = json.loads(image_boxes)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(422, "image_boxes must be valid JSON") from exc
+            if unused_boxes != []:
+                raise HTTPException(422, "Quick count uses marked areas, not reference boxes" if count_mode == "quick"
+                                    else "This model does not use per-image boxes")
+        if count_mode == "standard":
+            try:
+                unused_areas = json.loads(search_areas)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(422, "search_areas must be valid JSON") from exc
+            if unused_areas != []:
+                raise HTTPException(422, "Standard count does not use marked areas")
         batch_id = _id()
         files_dir = data_dir / session_id / "files"
         files_dir.mkdir(parents=True, exist_ok=True)
@@ -435,10 +511,28 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None):
                     "original_filename": filename, "sha256": sha256,
                     "width": width, "height": height,
                 })
+            if count_mode == "quick":
+                try:
+                    groups = parse_search_areas(
+                        search_areas, [(item["width"], item["height"]) for item in items])
+                except ValueError as exc:
+                    raise HTTPException(422, str(exc)) from exc
+                for item, areas in zip(items, groups):
+                    item["search_areas"] = areas
+            elif per_image:
+                groups = _parse_boxes(image_boxes, [(item["width"], item["height"]) for item in items],
+                                      per_image=True)
+                if saved["required_reference_boxes"] is not None and any(
+                        len(group) != saved["required_reference_boxes"] or
+                        len({tuple(box) for box in group}) != saved["required_reference_boxes"]
+                        for group in groups):
+                    raise HTTPException(422, "Each CountGD++ target image needs exactly 10 distinct boxes")
+                for item, boxes in zip(items, groups):
+                    item["reference_boxes"] = boxes
             if not slots.acquire(blocking=False):
                 raise HTTPException(429, "The counting queue is full; try again shortly")
             try:
-                error = store.create_batch(session_id, batch_id, items)
+                error = store.create_batch(session_id, batch_id, items, count_mode=count_mode)
                 if error:
                     status = 404 if error == "missing" else 409
                     detail = {"missing": "Session not found", "finished": "Session is finished",
@@ -446,7 +540,7 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None):
                               "duplicate": "Image already exists in this session"}[error]
                     raise HTTPException(status, detail)
                 try:
-                    executor.submit(run_batch, session_id, batch_id, items)
+                    executor.submit(run_batch, session_id, batch_id, items, per_image, count_mode)
                 except Exception:
                     store.set_batch_status(batch_id, "failed", "Could not schedule counting. Please retry.")
                     raise
@@ -466,7 +560,76 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None):
             raise HTTPException(404, "Session not found")
         if error == "busy":
             raise HTTPException(409, "Wait for the current batch to finish")
+        if error == "unreviewed":
+            raise HTTPException(409, "Review and confirm every image before finishing this cross-check count")
         return detail_or_404(session_id)
+
+    def save_image_review(session_id, image_id, payload):
+        destination = None
+        committed = False
+        try:
+            session = store.session_row(session_id)
+            item = store.review_image_row(session_id, image_id)
+            if session is None or item is None:
+                raise HTTPException(404, "Image not found in this session")
+            if session["status"] != "active":
+                raise HTTPException(409, "Session is finished")
+            if item["batch_status"] != "complete":
+                raise HTTPException(409, "Wait for this image to finish counting")
+            if item["review_revision"] != payload["revision"]:
+                raise HTTPException(409, "This image was reviewed elsewhere. Reload the latest result before saving")
+            boxes = payload["boxes"]
+            detections = []
+            for index, box in enumerate(boxes, 1):
+                if (not isinstance(box, list) or len(box) != 4 or
+                        any(isinstance(n, bool) or not isinstance(n, (int, float)) or not math.isfinite(n)
+                            for n in box)):
+                    raise HTTPException(422, "Each review box needs four finite pixel coordinates")
+                x1, y1, x2, y2 = box
+                if not (0 <= x1 < x2 <= item["width"] and 0 <= y1 < y2 <= item["height"]):
+                    raise HTTPException(422, "Review boxes must have positive area and fit inside the image")
+                detections.append({"index": index, "box": box, "confidence": None, "source": "review"})
+            from .inference import _draw_detections, _read_image
+            files_dir = data_dir / session_id / "files"
+            filename = f"reviewed-{image_id}-{uuid.uuid4().hex}.jpg"
+            destination = files_dir / filename
+            image = _read_image(str(files_dir / item["original_filename"]))
+            _draw_detections(image, detections, destination)
+            error = store.save_review(session_id, image_id, payload["revision"], detections,
+                                      filename, payload["reviewed"])
+            if error:
+                raise HTTPException(404 if error == "missing" else 409, {
+                    "missing": "Image not found in this session", "finished": "Session is finished",
+                    "busy": "Wait for all batches in this session to finish before reviewing",
+                    "stale": "This image was reviewed elsewhere. Reload the latest result before saving",
+                }[error])
+            committed = True
+            if item["review_annotated_filename"]:
+                try:
+                    (files_dir / item["review_annotated_filename"]).unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("Could not remove superseded review annotation for %s", image_id)
+            return detail_or_404(session_id)
+        finally:
+            if destination is not None and not committed:
+                destination.unlink(missing_ok=True)
+            slots.release()
+
+    @app.post("/api/sessions/{session_id}/images/{image_id}/review")
+    def review_image(session_id: str, image_id: str, payload: dict = Body(...)):
+        if (set(payload) != {"revision", "boxes", "reviewed"} or
+                type(payload["revision"]) is not int or payload["revision"] < 0 or
+                type(payload["reviewed"]) is not bool or not isinstance(payload["boxes"], list) or
+                len(payload["boxes"]) > 30000):
+            raise HTTPException(422, "Provide revision, up to 30000 boxes, and a reviewed boolean")
+        if not slots.acquire(blocking=False):
+            raise HTTPException(429, "The counting queue is full; try again shortly")
+        try:
+            future = executor.submit(save_image_review, session_id, image_id, payload)
+        except Exception:
+            slots.release()
+            raise
+        return future.result()
 
     @app.get("/api/sessions/{session_id}/export.csv")
     def export_csv(session_id: str):
@@ -482,6 +645,10 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None):
                     "No matches detected. Check the reference or use a model trained for this object."
                     if result["count"] == 0 else ""
                 )
+                if result["reviewed"]:
+                    warning = f"Human reviewed; model count {result['model_count']}. " + warning
+                elif session["requires_review"]:
+                    warning = f"Unreviewed count; model count {result['model_count']}. " + warning
                 writer.writerow([_csv_safe(session["label"]), batch["id"],
                                  _csv_safe(result["filename"]), result["count"], running,
                                  _csv_safe(warning)])
@@ -498,7 +665,7 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None):
         return FileResponse(path, media_type="image/jpeg")
 
     static_dir = Path(__file__).parent / "static"
-    app.mount("/", StaticFiles(directory=static_dir, html=True, check_dir=False), name="static")
+    app.mount("/", RevalidatingStaticFiles(directory=static_dir, html=True, check_dir=False), name="static")
     return app
 
 

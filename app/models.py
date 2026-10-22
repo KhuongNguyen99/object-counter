@@ -16,10 +16,18 @@ MODEL_ASSETS = {
     "yoloe-26x-seg.pt": (171640453, "d08d390a08f98195f7c87807839fe4ff93a5491645fef1bc3bf0700efafdd639"),
 }
 MODEL_FILENAMES = tuple(MODEL_ASSETS)
+FASTSAM_MODEL_ID = "fastsam-s"
+FASTSAM_FILENAME = "FastSAM-s.pt"
+# Official Ultralytics assets release v8.4.0, used only for reference proposals.
+FASTSAM_ASSETS = {
+    FASTSAM_FILENAME: (23851578, "c9f78716a81c7aff0d608ccc73e1b82ab3aaad86005049f6a92106a0be6d0844"),
+}
 SIZE_NAMES = {"n": "Nano", "s": "Small", "m": "Medium", "l": "Large", "x": "Extra large"}
 COUNTGD_MODEL_ID = "countgd-plusplus"
+CROSSCHECK_MODEL_ID = "crosscheck-countgd-yoloe26x"
 PETDINO_MODEL_ID = "pet-dino-swin-t"
 SAM3COUNT_MODEL_ID = "sam3count"
+SAM3_MODEL_ID = "sam3"
 # Approved official Meta base and the SAM3Count authors' public dense-counting overlay.
 SAM3COUNT_ASSETS = {
     "sam3.pt": (3450062241, "9999e2341ceef5e136daa386eecb55cb414446a00ac2b55eb2dfd2f7c3cf8c9e"),
@@ -71,6 +79,20 @@ def validate_sam3count_assets(directory: Path | None = None) -> None:
                 raise ValueError(f"SAM3Count asset {name} failed SHA-256 validation.")
 
 
+def validate_sam3_base_asset(directory: Path | None = None) -> None:
+    directory = directory or sam3count_dir()
+    name = "sam3.pt"
+    size, digest = SAM3COUNT_ASSETS[name]
+    path = directory / name
+    if not path.is_file():
+        raise FileNotFoundError("SAM3 base checkpoint is missing.")
+    if path.stat().st_size != size:
+        raise ValueError("SAM3 base checkpoint is incomplete or invalid.")
+    with path.open("rb") as stream:
+        if hashlib.file_digest(stream, "sha256").hexdigest() != digest:
+            raise ValueError("SAM3 base checkpoint failed SHA-256 validation.")
+
+
 def validate_petdino_assets(directory: Path | None = None) -> None:
     directory = directory or petdino_dir()
     assets = [(directory / name, size, digest) for name, (size, digest) in PETDINO_ASSETS.items()]
@@ -109,7 +131,7 @@ def checkpoint_path(model_id: str) -> Path:
 def validate_checkpoint(path: Path, filename: str | None = None) -> None:
     """Validate trusted release bytes before torch loads its pickle checkpoint."""
     filename = filename or path.name
-    expected_bytes, expected_hash = MODEL_ASSETS[filename]
+    expected_bytes, expected_hash = (MODEL_ASSETS | FASTSAM_ASSETS)[filename]
     if not path.is_file():
         raise FileNotFoundError(f"Model {filename} is missing. Run python scripts/download_models.py first.")
     if path.stat().st_size != expected_bytes:
@@ -121,60 +143,13 @@ def validate_checkpoint(path: Path, filename: str | None = None) -> None:
 
 
 def list_models() -> list[dict]:
-    result = []
-    for filename, (expected_bytes, _) in MODEL_ASSETS.items():
-        model_id = Path(filename).stem
-        variant = model_id.split("-")[1]
-        size = variant[-1]
-        family = f"YOLOE-{variant[:-1]}"
-        path = model_dir() / filename
-        actual_bytes = path.stat().st_size if path.is_file() else 0
-        result.append({
-            "id": model_id,
-            "name": f"{family} {SIZE_NAMES[size]}",
-            "family": family,
-            "size": size,
-            "available": actual_bytes == expected_bytes,
-            "bytes": actual_bytes,
-        })
     paths = [countgd_dir() / filename for filename in COUNTGD_ASSETS]
     source_ready = (Path(os.environ.get("COUNTGD_SOURCE_DIR", "/opt/countgd")) / "cfg_app.py").is_file()
-    result.insert(0, {
-        "id": COUNTGD_MODEL_ID, "name": "CountGD++ (experimental)",
-        "family": "CountGD++", "size": "base", "default_confidence": 0.23,
+    return [{
+        "id": COUNTGD_MODEL_ID, "name": "CountGD++",
+        "family": "CountGD++", "size": "base", "default_confidence": 0.80,
+        "reference_mode": "per_image", "required_reference_boxes": 10,
         "available": source_ready and all(path.is_file() and path.stat().st_size == expected_bytes
                          for path, (expected_bytes, _) in zip(paths, COUNTGD_ASSETS.values())),
         "bytes": sum(path.stat().st_size for path in paths if path.is_file()),
-    })
-    pet_paths = [petdino_dir() / name for name in PETDINO_ASSETS]
-    pet_source = Path(os.environ.get("PETDINO_SOURCE_DIR", "/opt/petdino"))
-    pet_python = Path(os.environ.get("PETDINO_PYTHON", "/opt/petdino-venv/bin/python"))
-    result.insert(1, {
-        "id": PETDINO_MODEL_ID, "name": "PET-DINO Swin-T (experimental)",
-        "family": "PET-DINO", "size": "t", "default_confidence": .3,
-        "available": pet_python.is_file() and
-                     (pet_source / "configs/pet_dino/pet_dino_swin-t_8xb4_12e_obj365.py").is_file() and
-                     all(path.is_file() and path.stat().st_size == size
-                         for path, (size, _) in zip(pet_paths, PETDINO_ASSETS.values())) and
-                     all((countgd_dir() / name).is_file() and (countgd_dir() / name).stat().st_size == size
-                         for name, (size, _) in COUNTGD_ASSETS.items() if name.startswith("bert-base-uncased/")),
-        "bytes": sum(path.stat().st_size for path in pet_paths if path.is_file()),
-    })
-    sam_paths = [sam3count_dir() / name for name in SAM3COUNT_ASSETS]
-    sam_source = Path(os.environ.get("SAM3_SOURCE_DIR", "/opt/sam3"))
-    sam_count_source = Path(os.environ.get("SAM3COUNT_SOURCE_DIR", "/opt/sam3count"))
-    sam_ready = ((sam_source / "sam3/model_builder.py").is_file() and
-                 (sam_source / "sam3/assets/bpe_simple_vocab_16e6.txt.gz").is_file() and
-                 (sam_count_source / "sam3count_images.py").is_file() and
-                 all(path.is_file() and path.stat().st_size == size
-                     for path, (size, _) in zip(sam_paths, SAM3COUNT_ASSETS.values())))
-    if sam_ready:
-        import torch
-        sam_ready = os.environ.get("DEVICE", "auto") != "cpu" and torch.cuda.is_available()
-    result.insert(1, {
-        "id": SAM3COUNT_MODEL_ID, "name": "SAM3Count-FT (experimental)",
-        "family": "SAM3Count", "size": "base", "default_confidence": .35,
-        "reference_mode": "none", "requires_gpu": True, "available": sam_ready,
-        "bytes": sum(path.stat().st_size for path in sam_paths if path.is_file()),
-    })
-    return result
+    }]

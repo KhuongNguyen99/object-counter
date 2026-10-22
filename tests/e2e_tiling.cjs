@@ -15,12 +15,14 @@ const base = process.env.APP_URL || 'http://localhost:8080';
 const report = { base, model, errors: [], referenceWarnings: [], startedAt: new Date().toISOString() };
 
 async function clearSuggestedBoxes(page) {
-  await page.waitForFunction(() => !document.querySelector('#start-button').disabled &&
-    document.querySelector('#auto-detect-boxes').textContent !== 'Detecting…', null, { timeout: 240000 });
-  while (await page.locator('#box-list button').count()) await page.locator('#box-list button').first().click();
+  while (await page.locator('.reference-box-remove').count()) {
+    await page.locator('.reference-box-remove').first().click();
+  }
+  assert.equal(await page.locator('.reference-box-marker').count(), 0, 'automatic selections cleared');
 }
 
 (async () => {
+  assert.ok(isYOLOE || model === 'countgd-plusplus', `Unsupported tiling model: ${model}`);
   fs.mkdirSync(output, { recursive: true });
   const browser = await chromium.launch({
     executablePath: process.env.EDGE_EXE || 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe', headless: true,
@@ -36,27 +38,49 @@ async function clearSuggestedBoxes(page) {
     await page.goto(base);
     await page.locator(`#model-select option[value="${model}"]`).waitFor({ state: 'attached' });
     await page.locator('#model-select').selectOption(model);
-    await page.locator('#object-label').fill('Bolt with red cap');
+    if (isYOLOE) await page.locator('#object-label').fill('Bolt with red cap');
     await page.locator('#confidence').evaluate((input, value) => {
       input.value = value; input.dispatchEvent(new Event('input', { bubbles: true }));
     }, isYOLOE ? '0.25' : '0.5');
-    await page.locator('#reference-gallery').setInputFiles(path.join(root, 'test-results/fitting-debug/reference-original.jpg'));
+    const proposalResponse = page.waitForResponse(response => response.url().endsWith('/api/reference-boxes') &&
+      response.request().method() === 'POST', { timeout: 240000 });
+    const targetPhoto = path.join(root, 'test-results/fitting-debug/target-original.jpg');
+    await page.locator(isYOLOE ? '#reference-gallery' : '#target-gallery').setInputFiles(
+      isYOLOE ? path.join(root, 'test-results/fitting-debug/reference-original.jpg') : targetPhoto);
     await page.locator('#reference-editor').waitFor({ state: 'visible' });
-    await clearSuggestedBoxes(page);
-    await page.locator('.coordinate-entry summary').click();
-    const referenceBox = isYOLOE ? { x1: 1000, y1: 1702, x2: 1379, y2: 2256 } :
-      { x1: 1039, y1: 1775, x2: 1344, y2: 2170 };
-    for (const [name, value] of Object.entries(referenceBox)) {
-      await page.locator(`#box-${name}`).fill(String(value));
+    assert.equal((await proposalResponse).status(), 200, 'automatic reference boxes completed');
+    await page.waitForFunction(() => document.querySelector('#auto-detect-boxes').getAttribute('aria-busy') !== 'true',
+      null, { timeout: 240000 });
+    let referenceBoxes;
+    if (isYOLOE) {
+      await clearSuggestedBoxes(page);
+      await page.locator('.coordinate-entry summary').click();
+      const referenceBox = { x1: 1000, y1: 1702, x2: 1379, y2: 2256 };
+      for (const [name, value] of Object.entries(referenceBox)) {
+        await page.locator(`#box-${name}`).fill(String(value));
+      }
+      await page.locator('#add-coordinate-box').click();
+      assert.deepEqual(JSON.parse(await page.locator('.reference-box-marker').getAttribute('data-box')),
+        Object.values(referenceBox), 'manual shared reference matches coordinates');
+      await page.locator('#target-gallery').setInputFiles(targetPhoto);
+    } else {
+      referenceBoxes = await page.locator('.reference-box-marker').evaluateAll((markers) =>
+        markers.map((marker) => JSON.parse(marker.dataset.box)));
+      assert.equal(referenceBoxes.length, 10, 'CountGD++ has ten selected boxes on the target photo');
     }
-    await page.locator('#add-coordinate-box').click();
-    await page.locator('#target-gallery').setInputFiles(path.join(root, 'test-results/fitting-debug/target-original.jpg'));
     const created = page.waitForResponse(response => response.url().endsWith('/api/sessions') && response.request().method() === 'POST');
     await page.locator('#start-button').click();
     const response = await created;
     assert.equal(response.status(), 201);
     const initial = await response.json();
     assert.equal(initial.model, model);
+    if (isYOLOE) {
+      assert.deepEqual(initial.references[0].boxes, [[1000, 1702, 1379, 2256]]);
+    } else {
+      assert.equal(initial.reference_mode, 'per_image');
+      assert.equal(initial.required_reference_boxes, 10);
+      assert.deepEqual(initial.references, []);
+    }
     report.sessionId = initial.id;
     console.log(`[tiling] 4K fitting photo submitted: ${initial.id}`);
     let session;
@@ -70,6 +94,8 @@ async function clearSuggestedBoxes(page) {
     }
     assert.equal(session.batches[0]?.status, 'complete', 'Tiled inference timed out');
     const result = session.batches[0].results[0];
+    if (!isYOLOE) assert.deepEqual(result.reference_boxes, referenceBoxes,
+      'CountGD++ uses the ten selected target-photo boxes');
     assert.equal(result.width, 4000);
     assert.equal(result.height, 2252);
     assert.equal(result.processing.tiles, expectedTiles);

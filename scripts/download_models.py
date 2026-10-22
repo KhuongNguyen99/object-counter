@@ -1,4 +1,4 @@
-"""Download or verify every supported visual YOLOE checkpoint, without importing torch."""
+"""Download or verify bundled YOLOE and FastSAM checkpoints without importing torch."""
 
 import argparse
 from pathlib import Path
@@ -8,7 +8,9 @@ import urllib.error
 import urllib.request
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from app.models import ASSET_RELEASE, MODEL_ASSETS, MODEL_FILENAMES, model_dir, validate_checkpoint
+from app.models import ASSET_RELEASE, FASTSAM_ASSETS, MODEL_ASSETS, model_dir, validate_checkpoint
+
+DOWNLOAD_ASSETS = MODEL_ASSETS | FASTSAM_ASSETS
 
 
 def download(filename: str, directory: Path) -> None:
@@ -20,7 +22,7 @@ def download(filename: str, directory: Path) -> None:
     except (FileNotFoundError, ValueError):
         pass
 
-    expected_size = MODEL_ASSETS[filename][0]
+    expected_size = DOWNLOAD_ASSETS[filename][0]
     partial = destination.with_suffix(".pt.part")
     url = f"https://github.com/ultralytics/assets/releases/download/{ASSET_RELEASE}/{filename}"
     for attempt in range(1, 5):
@@ -76,11 +78,11 @@ def download(filename: str, directory: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", type=Path, default=model_dir())
-    parser.add_argument("--models", nargs="+", help="Optional checkpoint stems or filenames; default: all five YOLOE-26 models")
+    parser.add_argument("--models", nargs="+", help="Optional checkpoint stems or filenames; default: all five YOLOE-26 models and FastSAM-s")
     parser.add_argument("--verify-only", action="store_true", help="Check all files without network access")
     args = parser.parse_args()
-    filenames = [name if name.endswith(".pt") else f"{name}.pt" for name in args.models] if args.models else MODEL_FILENAMES
-    unknown = set(filenames) - set(MODEL_FILENAMES)
+    filenames = [name if name.endswith(".pt") else f"{name}.pt" for name in args.models] if args.models else tuple(DOWNLOAD_ASSETS)
+    unknown = set(filenames) - set(DOWNLOAD_ASSETS)
     if unknown:
         parser.error(f"Unknown models: {', '.join(sorted(unknown))}")
     args.model_dir.mkdir(parents=True, exist_ok=True)

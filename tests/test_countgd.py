@@ -174,7 +174,8 @@ def test_invalid_model_boxes_fail_instead_of_being_reported_as_merged_duplicates
                      [str(source)], str(tmp_path / "output"))
 
 
-def test_reference_conditioning_reused_across_tiles_and_images_but_not_requests(tmp_path):
+@pytest.mark.parametrize("label,caption", [("white.ring", "white ring . "), ("", " . ")])
+def test_reference_conditioning_reused_across_tiles_and_images_but_not_requests(tmp_path, label, caption):
     import torch
 
     class Model:
@@ -212,12 +213,12 @@ def test_reference_conditioning_reused_across_tiles_and_images_but_not_requests(
     engine._nested_tensor = lambda tensors: tensors
     engine.transform, engine.model = transform, Model()
     references = [{"path": str(first), "boxes": [[1, 2, 10, 12]]}]
-    result = engine.count(references, [str(target), str(target)], str(tmp_path / "output"), label="white.ring")
+    result = engine.count(references, [str(target), str(target)], str(tmp_path / "output"), label=label)
     assert [item["processing"]["tiles"] for item in result] == [2, 2]
     assert transforms.count("reference") == 1 and transforms.count("target") == 4
     assert len(engine.model.prepared) == 1
     assert all(value is engine.model.prepared[0] for value in engine.model.received)
-    assert engine.model.prepared[0]["caption"] == "white ring . "
+    assert engine.model.prepared[0]["caption"] == caption
 
     engine.count([{"path": str(second), "boxes": [[2, 3, 11, 13]]}], [str(target)],
                  str(tmp_path / "next"), label="cap")
@@ -228,7 +229,7 @@ def test_reference_conditioning_reused_across_tiles_and_images_but_not_requests(
     assert not torch.equal(engine.model.prepared[0]["boxes"], engine.model.prepared[1]["boxes"])
 
     uncached = engine.count(references, [str(target)], str(tmp_path / "uncached"),
-                            label="white.ring", cache_reference=False)
+                            label=label, cache_reference=False)
     assert len(engine.model.prepared) == 4
     assert transforms.count("reference") == 4
     assert uncached[0]["detections"] == result[0]["detections"]

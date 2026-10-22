@@ -124,18 +124,21 @@ async function preview(page, index, result) {
     const proposal = await proposalResponse;
     assert.equal(proposal.status(), 200, `Automatic reference boxes: ${await proposal.text()}`);
     const suggested = await proposal.json();
-    assert.equal(suggested.model, 'countgd-plusplus', 'CountGD++ still proposes PET-DINO reference boxes');
+    assert.equal(suggested.model, 'fastsam-s', 'FastSAM-s proposes PET-DINO reference boxes');
     assert.deepEqual([suggested.width, suggested.height], [2252, 4000]);
     save('reference-proposal.json', suggested);
-    await page.waitForFunction(() => !document.querySelector('#start-button').disabled &&
-      document.querySelector('#auto-detect-boxes').textContent !== 'Detecting…', null, { timeout: 240000 });
-    while (await page.locator('#box-list button').count()) await page.locator('#box-list button').first().click();
-    assert.equal(await page.locator('#box-list button').count(), 0);
+    await page.waitForFunction(() => document.querySelector('#auto-detect-boxes').getAttribute('aria-busy') !== 'true', null, { timeout: 240000 });
+    while (await page.locator('.reference-box-remove').count()) {
+      await page.locator('.reference-box-remove').first().click();
+    }
+    assert.equal(await page.locator('.reference-box-marker').count(), 0, 'automatic selections cleared');
     await page.locator('.coordinate-entry summary').click();
     for (const [name, value] of Object.entries({ x1: referenceBox[0], y1: referenceBox[1],
       x2: referenceBox[2], y2: referenceBox[3] })) await page.locator(`#box-${name}`).fill(String(value));
     await page.locator('#add-coordinate-box').click();
-    assert.equal(await page.locator('#box-list button').count(), 1);
+    assert.equal(await page.locator('.reference-box-marker').count(), 1);
+    assert.deepEqual(JSON.parse(await page.locator('.reference-box-marker').getAttribute('data-box')),
+      referenceBox, 'manual reference overlay matches coordinates');
     await page.setViewportSize({ width: 390, height: 844 });
     report.mobileEditor = await noOverflow(page, 'PET-DINO reference editor at 390px');
     await page.screenshot({ path: path.join(output, 'mobile-editor.png'), fullPage: true });

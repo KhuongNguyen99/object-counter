@@ -1,5 +1,7 @@
 import math
+from types import SimpleNamespace
 
+import numpy as np
 from PIL import Image
 import pytest
 
@@ -24,50 +26,71 @@ def test_near_full_frame_mask_cannot_suppress_a_real_example():
     assert selected == [([400, 300, 500, 400], .99)]
 
 
-class FakeCore:
+class FakeFastSAM:
     def __init__(self, boxes, scores):
         self.boxes, self.scores = boxes, scores
 
-    def _predict(self, image, exemplar, boxes, confidence, label):
-        self.call = (image.size, image is exemplar, boxes, confidence, label)
-        return self.boxes, self.scores
+    def predict(self, image, **kwargs):
+        self.call = (image, kwargs)
+        result = SimpleNamespace(boxes=SimpleNamespace(
+            xyxy=np.asarray(self.boxes, dtype=float), conf=np.asarray(self.scores, dtype=float)))
+        return [result]
 
 
-def test_text_only_proposals_map_to_original_pixels_and_suppress_nested_parts(tmp_path):
-    detector = FakeCore([[1150 / 2252, 1925 / 4000, 300 / 2252, 450 / 4000],
-                         [1150 / 2252, 1760 / 4000, 190 / 2252, 80 / 4000]], [.54, .33])
+def test_prompt_free_proposals_use_original_pixels_and_suppress_nested_parts(tmp_path):
+    detector = FakeFastSAM([[1000, 1700, 1300, 2150], [1055, 1720, 1245, 1800]], [.54, .98])
     path = tmp_path / "reference.jpg"
     Image.new("RGB", (2252, 4000), "brown").save(path)
-    result = reference.propose_boxes(detector, str(path), "bolt with red cap")
+
+    result = reference.propose_boxes(detector, str(path), "cpu")
+
+    assert result["model"] == "fastsam-s"
     assert (result["width"], result["height"]) == (2252, 4000)
-    assert len(result["boxes"]) == 1
-    assert result["boxes"][0] == pytest.approx([991, 1691, 1309, 2159], abs=1)
-    assert detector.call == ((2252, 4000), True, [], .23, "bolt with red cap")
-    assert Image.open(path).size == (2252, 4000)
+    assert result["boxes"] == [[991, 1691, 1309, 2159]]
+    assert result["warning"] is None
+    assert result["elapsed_ms"] >= 0
+    image, kwargs = detector.call
+    assert image.mode == "RGB" and image.size == (2252, 4000)
+    assert kwargs == {"device": "cpu", "imgsz": 1024, "conf": .25, "iou": .9,
+                      "retina_masks": False, "verbose": False, "save": False}
 
 
-def test_no_confident_object_keeps_manual_fallback(tmp_path):
-    detector = FakeCore([], [])
+def test_no_candidates_invites_manual_box(tmp_path):
+    detector = FakeFastSAM([], [])
     path = tmp_path / "blank.jpg"
     Image.new("RGB", (100, 100), "gray").save(path)
-    result = reference.propose_boxes(detector, str(path), "ring")
+    result = reference.propose_boxes(detector, str(path), "0")
     assert result["boxes"] == []
-    assert "draw a box manually" in result["warning"]
+    assert "draw a box manually" in result["warning"].lower()
+    assert detector.call[1]["device"] == "0"
 
 
-@pytest.mark.parametrize("box,score", [([.5, .5, math.nan, .1], .9), ([.5, .5, .1, .1], math.inf),
-                                      ([1.1, .5, .1, .1], .9), ([.5, .5, 0, .1], .9)])
+@pytest.mark.parametrize("box,score", [([20, 20, math.nan, 40], .9),
+                                      ([20, 20, 40, 40], math.inf),
+                                      ([20, 20, 101, 40], .9),
+                                      ([20, 20, 20, 40], .9),
+                                      ([20, 20, 40], .9),
+                                      ([20, 20, 40, 40], 1.1)])
 def test_invalid_model_outputs_fail_instead_of_creating_boxes(tmp_path, box, score):
     path = tmp_path / "reference.png"
     Image.new("RGB", (100, 100), "gray").save(path)
     with pytest.raises(ValueError, match="invalid box"):
-        reference.propose_boxes(FakeCore([box], [score]), str(path), "part")
+        reference.propose_boxes(FakeFastSAM([box], [score]), str(path), "cpu")
 
 
-def test_reference_box_limit_reports_truncation(tmp_path):
-    boxes = [[(50 + (i % 10) * 80) / 1000, (50 + (i // 10) * 80) / 800, .02, .03] for i in range(40)]
+def test_mismatched_box_and_score_counts_fail(tmp_path):
+    path = tmp_path / "reference.png"
+    Image.new("RGB", (100, 100), "gray").save(path)
+    with pytest.raises(ValueError, match="invalid box"):
+        reference.propose_boxes(FakeFastSAM([[20, 20, 40, 40]], []), str(path), "cpu")
+
+
+def test_reference_proposals_keep_all_eligible_boxes_beyond_32(tmp_path):
+    boxes = [[50 + (i % 10) * 80, 50 + (i // 10) * 80,
+              70 + (i % 10) * 80, 74 + (i // 10) * 80] for i in range(40)]
     path = tmp_path / "reference.png"
     Image.new("RGB", (1000, 800), "gray").save(path)
-    result = reference.propose_boxes(FakeCore(boxes, [.5 + i / 1000 for i in range(40)]), str(path), "part")
-    assert len(result["boxes"]) == 32
-    assert "32 strongest" in result["warning"]
+    result = reference.propose_boxes(FakeFastSAM(boxes, [.5 + i / 1000 for i in range(40)]), str(path), "cpu")
+    assert len(result["boxes"]) == 40
+    assert all(all(isinstance(value, int) for value in box) for box in result["boxes"])
+    assert result["warning"] is None

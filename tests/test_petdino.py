@@ -101,7 +101,7 @@ time.sleep(60)
     assert engine._process.poll() is not None
 
 
-def test_petdino_integrity_and_catalog_need_checkpoint_bert_source_and_runtime(tmp_path, monkeypatch):
+def test_petdino_integrity_remains_available_for_offline_research(tmp_path, monkeypatch):
     monkeypatch.setenv("MODEL_DIR", str(tmp_path))
     source = tmp_path / "source/configs/pet_dino"
     source.mkdir(parents=True)
@@ -115,10 +115,7 @@ def test_petdino_integrity_and_catalog_need_checkpoint_bert_source_and_runtime(t
     monkeypatch.setattr(models, "COUNTGD_ASSETS", {
         "bert-base-uncased/config.json": (len(bert), hashlib.sha256(bert).hexdigest())})
 
-    def entry():
-        return next(m for m in models.list_models() if m["id"] == models.PETDINO_MODEL_ID)
-
-    assert not entry()["available"]
+    assert [model["id"] for model in models.list_models()] == [models.COUNTGD_MODEL_ID]
     with pytest.raises(FileNotFoundError, match="missing"):
         models.validate_petdino_assets()
     models.petdino_dir().mkdir()
@@ -127,12 +124,12 @@ def test_petdino_integrity_and_catalog_need_checkpoint_bert_source_and_runtime(t
     path.parent.mkdir(parents=True)
     path.write_bytes(bert)
     models.validate_petdino_assets()
-    assert entry()["available"] and entry()["default_confidence"] == .3
+    assert [model["id"] for model in models.list_models()] == [models.COUNTGD_MODEL_ID]
     path.write_bytes(b"x" * len(bert))
     with pytest.raises(ValueError, match="SHA-256"):
         models.validate_petdino_assets()
     monkeypatch.setenv("PETDINO_PYTHON", str(tmp_path / "missing-python"))
-    assert not entry()["available"]
+    assert [model["id"] for model in models.list_models()] == [models.COUNTGD_MODEL_ID]
 
 
 def test_petdino_cache_closes_worker_on_model_switch_shutdown_and_failure(tmp_path, monkeypatch):

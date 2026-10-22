@@ -1,136 +1,70 @@
-# Reference Object Counter
+# Countwell
 
-A phone-friendly counting app with a FastAPI backend and a lightweight browser UI, shipped together in one Docker image. **CountGD++ (experimental)** is the default, alongside **SAM3Count-FT**, **PET-DINO Swin-T**, and all five **YOLOE-26** visual-prompt models (Nano, Small, Medium, Large, Extra Large). Weights and inference dependencies are bundled for offline counting. No cloud inference, API key, or runtime model download is needed.
+Countwell counts objects in photos on your computer or private network. New counts use [CountGD++](https://github.com/niki-amini-naieni/CountGDPlusPlus); [FastSAM-s](https://docs.ultralytics.com/models/fast-sam/) helps suggest objects to select. Both run locally after the Docker image is built. Counting does not require a cloud service or API key.
 
-## Run
+## Run with Docker
 
-Before the first build, put the approved [Meta `sam3.pt`](https://huggingface.co/facebook/sam3/blob/main/sam3.pt) and the [SAM3Count authors' `sam3_ft.pt`](https://drive.google.com/file/d/1uSpEeM9l9SN_Q_W-CJqYy75mQ-O75HpL/view) in `models/sam3count/`. Meta requires approved access before downloading its checkpoint. Docker verifies both pinned files and bundles them; credentials are not needed for inference. The other model weights are downloaded during the build when missing.
+This checkout needs `models/FastSAM-s.pt` and `models/countgd/` in the build context. The build verifies their contents and prepares the pinned CountGD++ source and offline text encoder. If you have a fresh checkout without those assets, use Python 3.11 to prepare them before building:
+
+```sh
+python -m pip install -r requirements.txt
+python scripts/download_models.py --model-dir models --models FastSAM-s
+python scripts/prepare_countgd.py --source-dir .vendor/countgd
+```
+
+The first download is large. The Docker build also downloads any missing CountGD++ assets and verifies their checksums. No SAM3 checkpoint is needed.
+
+For CPU counting:
 
 ```sh
 docker compose up --build -d
 ```
 
-Open **http://localhost:8080** on your computer. On a phone connected to the same Wi-Fi, open `http://YOUR-COMPUTER-LAN-IP:8080`. Allow inbound TCP port 8080 on your computer's private network if needed. The camera button uses the phone's native photo picker/camera; browser and phone behavior may vary. Gallery upload also works on desktop.
+Open **http://localhost:8080**. On a phone on the same Wi-Fi, use `http://YOUR-COMPUTER-LAN-IP:8080`; your computer may need to allow inbound TCP port 8080 on its private network. The Camera button uses the browser's photo picker or camera, depending on the device.
 
-The first build downloads Python packages and any missing model weights. The weights are baked into the image. Counting sessions, uploaded photos, and annotated results are stored in the `counter-data` Docker volume and survive container restarts. `docker compose down` keeps them; `docker compose down -v` removes them.
-
-### Tailscale access
-
-On this computer, open **https://artint-creare.tail11f4ee.ts.net:8081/** from a device connected to the same Tailscale network. The computer, Tailscale, and Docker app must be running. Access follows your tailnet's permissions.
-
-Tailscale Serve on the Docker host provides HTTPS and forwards to the app's local port. Port 8081 keeps the host's existing Serve endpoints available. To configure this on another host, first inspect `tailscale serve status` and choose an unused HTTPS port, then run:
-
-```sh
-tailscale serve --bg --https=8081 http://127.0.0.1:8080
-```
-
-Use the URL printed by the command. The background configuration survives Tailscale restarts. To remove just this endpoint, run `tailscale serve --https=8081 off`. See the [Tailscale Serve documentation](https://tailscale.com/docs/reference/tailscale-cli/serve).
-
-### NVIDIA GPU
-
-With Docker GPU support enabled (NVIDIA Container Toolkit on Linux, or Docker Desktop with WSL2 and supported NVIDIA drivers on Windows):
+For an NVIDIA GPU with Docker GPU support enabled (NVIDIA Container Toolkit on Linux, or Docker Desktop with WSL2 and supported drivers on Windows):
 
 ```sh
 docker compose -f compose.yaml -f compose.gpu.yaml up --build -d
 ```
 
-This builds `yoloe-counter:cuda128` with CUDA 12.8 PyTorch and requests the GPU for both CountGD++ and YOLOE. Keep both Compose files in subsequent GPU deployment commands. The regular Compose command builds the smaller `yoloe-counter:local` CPU image; run it again with `--build` to switch back. Both use the same session volume. The selected GPU deployment survives container and Docker restarts.
+Keep both Compose files in later GPU commands. The GPU build uses CUDA 12.8 PyTorch. Run the regular CPU command with `--build` to switch back. Both deployments use the same `counter-data` volume.
 
-CountGD++ GPU optimization measurements, exact-output checks, reproduction commands, and rollback steps are recorded in [PERFORMANCE.md](PERFORMANCE.md).
+Sessions, uploaded photos, and annotated results survive container restarts and `docker compose down`. **`docker compose down -v` deletes the data volume.** Use `docker compose logs -f counter` to inspect startup or counting errors.
 
-For later application-code-only rebuilds from this NAS workspace, reuse the dependencies and model files already in the GPU image. The build still verifies every checkpoint, and the resulting image includes all assets. Omit these context overrides when changing dependencies or bundled upstream source versions:
+### Private Tailscale access
+
+On the configured host, open **https://artint-creare.tail11f4ee.ts.net:8081/** from a device on the same tailnet. The computer, Docker, and Tailscale must be running. Access follows the tailnet's permissions. On another host, check `tailscale serve status`, choose an unused HTTPS port, then configure Tailscale Serve:
 
 ```sh
-docker build --build-context sam3count-dependencies=docker-image://yoloe-counter:cuda128 --build-context model-assets=docker-image://yoloe-counter:cuda128 --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128 -t yoloe-counter:cuda128 .
-docker compose -f compose.yaml -f compose.gpu.yaml up --no-build -d
+tailscale serve --bg --https=8081 http://127.0.0.1:8080
 ```
+
+Use the URL printed by that command. The Serve configuration survives Tailscale restarts; `tailscale serve --https=8081 off` removes this endpoint. See the [Tailscale Serve documentation](https://tailscale.com/docs/reference/tailscale-cli/serve).
 
 ## Count objects
 
-1. Describe the object and choose a model. For CountGD++, the Object field is also a text prompt: use a description such as **white plastic ring**. CountGD++ is the default trial model. YOLOE uses the visual references; its Nano variant favors speed, while larger sizes use more memory and compute.
-2. For reference-guided models, add one or more reference photos. The Object description guides automatic boxes around examples of the **same kind of object**. Review the numbered boxes, remove unwanted ones, or draw a box manually. If you add photos before entering a description, enter it and choose **Auto-detect**. References guide detection; they do not train the model or add to the total. **SAM3Count-FT uses the description alone**, so its reference controls are hidden.
-3. Take a photo or select one or more counting photos, then start counting.
-4. Review the numbered annotations and count on **each image**, the batch subtotal, and the session's running total. Detection details include the confidence of each numbered object. Zero detections are flagged **Review needed**; they do not prove that no objects are present.
-5. Add the next photos to accumulate another batch using the same references and model. Choose **Finish counting** when done, then start a new count for another object. A CSV export preserves the image and batch breakdown.
+1. Add up to 20 photos. For each photo, choose **exactly 10 different examples** of the object you want counted. To get suggestions, choose **Mark areas**, draw one or more areas, then choose **Find objects**. Check the suggested selections; select or draw any missing examples. Nothing is sent for counting until you start it.
+2. Check the outlines and selected object thumbnails. Click a thumbnail to focus its outline or use its **×** to deselect it. You can draw a box around an object, adjust a box, zoom, and undo. **Done** closes the editor; click a photo thumbnail to reopen it. Only selected examples guide that photo's count. The default **Match strength** is 0.80; a higher value keeps fewer, closer matches.
+3. Choose **Start counting**. Inspect the numbered result for each photo, its count, the batch subtotal, and the running total. Use **Review photo** to add or remove counted objects when needed; saving corrections updates the totals and downloadable results.
+4. Add another batch of photos if needed. Each new photo needs its own 10 selections. Choose **Finish count** when done, then **New count** to start over. **Download results** exports the photo and batch breakdown as CSV.
 
-Photograph new objects in each batch. The app adds detections across photos; it does not track physical objects between photos. Overlapping views can count the same object again. Exact repeated images within a session are rejected to help prevent accidental duplicate uploads. Failed batches do not change the total and can be retried. Your current session restores on reload; export its CSV before starting a new count.
+**Quick count** sits beside **Start counting** and **Count this batch**. For a few separate, evenly spaced objects, mark one or more areas on every photo and choose Quick count. It uses the same automatic box finder and counts all retained boxes in those areas, without requiring ten examples. Overlapping areas have repeated boxes merged. The usual size filter still applies. Find objects and Quick count keep all eligible suggestions returned by the finder; the former 32-box cutoff is removed. Results use the same review, corrections, totals, saved history and download flow. Match strength applies to regular counting.
 
-Use clear reference examples at a similar scale and viewpoint to your targets. A lower confidence threshold can recover missed objects but also add false or duplicate detections. Larger models do not guarantee accurate counts of unfamiliar parts. CountGD++ substantially improved the supplied white-ring examples, but still missed some overlapping rings and added extra detections. Its results remain marked **Review needed**. These two photos do not establish accuracy on new scenes. See [VERIFICATION.md](VERIFICATION.md) for the investigation. Always inspect the annotations before accepting a count.
+Photos that overlap may count the same physical object twice. Exact repeat uploads within a count are rejected. A zero count does not prove the object is absent; inspect the result image. Overlapping, tiny, partly hidden, or unfamiliar objects can be missed or counted twice. A clear photo and varied, correctly boxed examples help, but every result still needs review. Failed batches do not add to the total and can be retried.
 
-## Models and downloads
+Uploads accept JPEG, PNG, and WebP, up to 20 MB and 30 megapixels per photo. The browser can also convert HEIC if it can decode it; otherwise export JPEG. Your current count restores on page reload. Download its results before starting a new count if you need a separate copy.
 
-**PET-DINO Swin-T (experimental)** is an additional reference-guided detector. Its official checkpoint and source are bundled for offline use. Boxed examples from separate reference photos are encoded once per batch and combined using the upstream visual-embedding workflow. It returns bounding boxes for counting; it does not produce segmentation masks. Photos that would lose resolution use native 800-pixel crops and the existing cross-tile reconciliation. Review the numbered detections before accepting a count; this model is an alternative to evaluate, not a guaranteed accuracy upgrade.
+## Configuration and access
 
-PET-DINO's MMDetection/MMCV dependencies run in a separate bundled Python environment inside the same container. Switching models closes that worker before loading another model, preserving the single inference queue. CountGD++ remains the default and continues to suggest editable reference boxes for reference-guided models. No external inference service is required.
+Copy `.env.example` to `.env` to change `PORT`, `BIND_ADDRESS`, `DEVICE`, or `OMP_NUM_THREADS`. Defaults are port 8080, all network interfaces, automatic CPU/GPU selection, and four CPU threads. Set `BIND_ADDRESS=127.0.0.1` for access from this computer only.
 
-**SAM3Count-FT (experimental)** uses the [SAM3Count authors' public dense-counting checkpoint](https://github.com/Joan947/SAM3Count), built on Meta SAM 3. It accepts a text description, with no separate reference images. The app uses the upstream density decisions, adaptive crop grid, and box/mask duplicate suppression with the presence score disabled. Each surviving mask instance contributes one count; the UI displays numbered bounding boxes. Masks are held only while reconciling detections.
+The app has no login. Session links act as access keys, so use a trusted LAN or private tailnet. For public access, place it behind an authenticated HTTPS reverse proxy. Run one Uvicorn worker: its counting queue is process-local.
 
-The app adds a native-resolution safeguard: images larger than SAM 3's 1008-pixel input receive full overlapping crop coverage even when the coarse pass finds few objects. Coarse detections guide crop size but are excluded from the final count when those crops replace the full-image pass. Crop fragments use the app's shared association before duplicate suppression, so partial observations can be reconciled before evidence is discarded. Compact masks preserve the upstream mask-intersection calculation without allocating a full 4K mask for every object. Duplicate suppression can still make mistakes on touching or occluded objects; review the numbered results.
+Existing saved counts from earlier model experiments can still be viewed, reviewed, and exported. New batches for those retired models are blocked. [PERFORMANCE.md](PERFORMANCE.md) and [VERIFICATION.md](VERIFICATION.md) record earlier benchmarks and limitations; those comparisons do not describe model choices in the current app or establish unattended counting accuracy.
 
-This integration loads the approved Meta base checkpoint and overlays the authors' fine-tuned weights, retaining the base segmentation head that is absent from the fine-tuned file. It currently requires an NVIDIA CUDA GPU; CPU deployments keep the option unavailable. Other counting models retain CPU support. Both official source revisions and checkpoint bytes are pinned and verified before loading. SAM3Count code is MIT-licensed; the underlying SAM materials retain the [SAM License](https://github.com/facebookresearch/sam3/blob/main/LICENSE). Copies of both licenses are retained with their source inside the image at `/opt/sam3count/LICENSE` and `/opt/sam3/LICENSE`.
+## Source and licenses
 
-To reproduce the private-photo comparison after making the original fixtures available, run `python scripts/compare_counting_models.py --check-inputs`, then `python scripts/compare_counting_models.py --output-dir test-results/sam3count-comparison`. It compares identical target bytes and text, records CountGD++'s additional reference prompt, and checks ring detections against ground truth only when image hashes match. It produces a side-by-side `comparison.html` and machine-readable `comparison.json`. Totals without a verified ground truth are observations, not accuracy scores.
+CountGD++ uses its official checkpoint and source pinned to commit `8489f836d75eb407ae778c56cff1f72cc6f8baae`. The image retains its source and licenses at `/opt/countgd`. FastSAM-s uses the official Ultralytics asset, verified against its pinned size and SHA-256 digest. See the [CountGD++ repository](https://github.com/niki-amini-naieni/CountGDPlusPlus) and [Ultralytics FastSAM documentation](https://docs.ultralytics.com/models/fast-sam/) for upstream source and license terms. Both assets are bundled for offline use after build.
 
-The [official YOLOE documentation](https://docs.ultralytics.com/models/yoloe/) describes the visual-prompt models used here:
-
-| Size | Included checkpoint |
-| --- | --- |
-| Nano | `yoloe-26n-seg.pt` |
-| Small | `yoloe-26s-seg.pt` |
-| Medium | `yoloe-26m-seg.pt` |
-| Large | `yoloe-26l-seg.pt` |
-| Extra Large | `yoloe-26x-seg.pt` |
-
-[CountGD++](https://github.com/niki-amini-naieni/CountGDPlusPlus) uses the official `countgd_plusplus.pth` checkpoint and BERT assets under `models/countgd/`. Its source is pinned to commit `8489f836d75eb407ae778c56cff1f72cc6f8baae`; the original source and licenses are preserved at `/opt/countgd` in the image. A compatibility patch selects the repository's existing PyTorch attention implementation when its compiled extension is absent. All model assets are checked against pinned SHA-256 digests before loading.
-
-The downloader verifies official checkpoint checksums. To populate `models/` before building:
-
-```sh
-python scripts/download_models.py --model-dir models
-python scripts/prepare_countgd.py --source-dir .vendor/countgd
-python scripts/prepare_petdino.py --assets-only
-```
-
-The PET-DINO checkpoint is pinned to the [authors' release](https://huggingface.co/fuweifu/PET-DINO/tree/a8d8cddbe752bbcc3df299b2fe56d0aa67a26776), with size and SHA-256 checked before deserialization. Its [source](https://github.com/fuweifuvtoo/PET_DINO) is pinned to `7830a462f9a320f34293cce0aabdda1256d9dc15` under `/opt/petdino`, with its license retained. The build downloads missing assets and prepares the isolated runtime; subsequent inference runs offline. PET-DINO shares the already bundled BERT files with CountGD++.
-
-YOLOE visual references are encoded and combined into one target class. CountGD++ uses the object description and boxed references; examples from multiple reference photos are arranged into one contact sheet. Extra references can change both misses and false detections, so inspect the annotations. The runtime loads one selected model at a time and serializes inference to avoid GPU memory contention and prompt state mixing between sessions. CountGD++ uses its bundled offline BERT encoder. It prepares the reference image, reference features, and text features once per counting batch, then reuses them across its tiles and images. Each tile receives fresh text state for image/text fusion; a new batch prepares new conditioning. This cache works on CPU and GPU without changing resolution, overlap, confidence, or model precision.
-
-Automatic reference boxes use the bundled CountGD++ detector in text-only mode, independently of the model selected for counting. Its proposed boxes use original-photo coordinates and become ordinary editable references for every counting model. Nested part proposals are suppressed in favor of a complete enclosing object; edge-clipped and near-full-frame proposals are excluded. This is a suggestion step, and the description may match the wrong object or miss an unfamiliar one. The minimum-confidence slider controls counting, while reference suggestions use 0.23. Empty results leave the photo available for manual drawing. Temporary proposal uploads are removed when processing finishes; accepted reference images are saved only when the count is created. Reference detection shares the single worker and CountGD++ cache with counting, and requires no additional model download or service.
-
-Large photos are automatically counted in overlapping crops whenever the selected model would otherwise reduce the source resolution. YOLOE uses crops up to its configured input size (640×640 by default); CountGD++ uses up to 800×800. Crops use the original pixels with at least 20% overlap. Neighboring detections are translated into the original photo's coordinates and reconciled before the final count; tile subtotals are not added directly. The result shows one full-resolution annotated photo, a tile count, and merge information inside Details. Larger photos take longer. This handles repeated views caused by tiling; the model can still miss objects or produce incorrect detections. Overlapping photos in separate uploads remain additive.
-
-## Configuration
-
-Copy `.env.example` to `.env` to change `PORT`, `BIND_ADDRESS`, `DEVICE`, or `OMP_NUM_THREADS`. Defaults are port 8080, all network interfaces, automatic device selection, and four CPU compute threads. Use `BIND_ADDRESS=127.0.0.1` for computer-only access.
-
-This app is intended for your computer, a trusted LAN, or your private Tailscale network. Session links act as access keys; there is no app login. Keep tailnet access limited to trusted users. Use an authenticated HTTPS reverse proxy for public access.
-
-JPEG, PNG, and WebP images are supported, up to 20 MB and 30 megapixels per image, 8 references, 32 reference rectangles, and 20 counting images per batch. The browser also converts HEIC when it can decode it; otherwise export the photo as JPEG. Originals are normalized for EXIF orientation before inference. Interrupted jobs become failed on restart and can be retried; finished counts remain saved.
-
-YOLOE uses a 640-pixel input size and permits up to 3,000 detections per crop. Advanced deployments can pass `IMGSZ` (32–4096) or `MAX_DETECTIONS` (1–30000) as container environment variables for YOLOE; larger values need more memory and time. CountGD++ uses its official 800-pixel short-side / 1333-pixel maximum resize on each crop, with 900 detection queries per crop. Warnings appear if any crop reaches its model's limit; the merged photo can contain more objects than a single crop's limit. Photos requiring more than 256 crops are rejected with a clear error; use a less extreme image aspect ratio.
-
-Useful commands:
-
-```sh
-docker compose logs -f counter
-docker compose ps
-docker compose stop
-```
-
-## Local development and checks
-
-Python 3.11 is used by the image. For local CPU development:
-
-```sh
-python -m venv .venv
-# Activate .venv using your shell's activation command.
-python -m pip install torch==2.9.1 torchvision==0.24.1 --index-url https://download.pytorch.org/whl/cpu
-python -m pip install -r requirements-dev.txt
-python scripts/download_models.py --model-dir models
-python scripts/prepare_countgd.py --source-dir .vendor/countgd
-# Set COUNTGD_SOURCE_DIR to the absolute .vendor/countgd path before starting Python locally.
-python -m pytest -q
-python -m uvicorn app.main:app --host 0.0.0.0 --port 8080 --workers 1
-```
-
-Use exactly **one Uvicorn worker**: the inference queue and active model are process-local. API tests inject a deterministic inference engine; set `RUN_MODEL_TESTS=1` to also exercise all five real YOLOE checkpoints. These checkpoint tests default to CPU; set `MODEL_TEST_DEVICE=0` to verify each size on CUDA. `RUN_COUNTGD_TESTS=1` enables the local CountGD++ comparison when the benchmark fixtures are present and follows `DEVICE`. Run `node --test tests/test_frontend.mjs` for the browser-handler regressions. Real model, Docker, and desktop/mobile browser verification is recorded in [VERIFICATION.md](VERIFICATION.md).
+For local CPU development, install Python 3.11, the CPU PyTorch wheels (`torch==2.9.1`, `torchvision==0.24.1`), and `requirements-dev.txt`. Prepare the two assets as above, set `COUNTGD_SOURCE_DIR` to the absolute `.vendor/countgd` path, then run `python -m pytest -q` or `python -m uvicorn app.main:app --host 127.0.0.1 --port 8080 --workers 1`.

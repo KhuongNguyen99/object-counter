@@ -6,8 +6,12 @@
   <meta name="theme-color" content="#f6f8f7">
   <title>Countwell · Object counting</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/styles.css">
-  <script src="/app.js" defer></script>
+  <meta name="app-version" content="all-suggestions-1">
+  <link rel="stylesheet" href="/styles.css?v=all-suggestions-1">
+  <link rel="stylesheet" href="/reference-review.css?v=all-suggestions-1">
+  <script src="/reference-review.js?v=all-suggestions-1" defer></script>
+  <script src="/reference-selection.js?v=all-suggestions-1" defer></script>
+  <script src="/app.js?v=all-suggestions-1" defer></script>
 </head>
 <body>
   <header class="site-header">
@@ -19,10 +23,10 @@
     <details class="help-menu">
       <summary>Help</summary>
       <div class="help-content">
-        <p>Draw boxes around examples of the same object in your references.</p>
-        <p>The Object description guides automatic reference boxes and CountGD++ counts. SAM3Count uses only this description.</p>
-        <p>Every photo adds to the total. Overlapping photos can count the same objects again.</p>
-        <p>Up to 8 references, 32 boxes, and 20 photos per batch. JPEG, PNG, or WebP, up to 20 MB and 30 megapixels each. HEIC works when your browser supports it.</p>
+        <p>Add photos, then choose exactly 10 examples of the object in each photo. Mark areas and choose Find objects, or draw boxes yourself.</p>
+        <p>For a few separate, evenly spaced objects, mark the areas to search and choose Quick count. You do not need to choose examples.</p>
+        <p>Photos that overlap may count the same object twice.</p>
+        <p>Up to 20 photos at a time. JPEG, PNG, or WebP; up to 20 MB per photo.</p>
       </div>
     </details>
   </header>
@@ -35,44 +39,70 @@
     <div id="notice" class="notice" role="alert" hidden></div>
 
     <section id="setup-view" class="workspace-grid" aria-labelledby="setup-title">
-      <div class="workspace-main">
-        <section class="panel setup-panel" aria-label="Count settings">
+      <div class="workspace-main" id="setup-main">
+        <section hidden aria-hidden="true">
           <div class="field-grid">
-            <label class="field">Object
+            <label id="object-description-field" class="field"><span>Object description <span id="object-description-optional" hidden>(optional)</span></span>
               <input id="object-label" type="text" maxlength="80" placeholder="e.g. Red apples" autocomplete="off" required>
             </label>
             <label class="field">Model
               <select id="model-select" aria-describedby="model-help"></select>
-              <span id="model-help" class="visually-hidden">Loading models…</span>
+              <span id="model-help" class="visually-hidden">Getting ready…</span>
             </label>
           </div>
-          <p id="text-prompt-note" class="quiet-note" hidden>Uses the Object description; no reference photos.</p>
-          <details class="advanced"><summary>Options</summary>
-            <label class="field confidence-field">Minimum confidence <strong id="confidence-value">0.25</strong>
-              <input id="confidence" type="range" min="0.01" max="0.95" step="0.01" value="0.25">
-              <small>Higher values show fewer, more certain detections.</small>
-            </label>
-          </details>
+          <p id="text-prompt-note" class="quiet-note" hidden>Uses the Object description; no photos.</p>
+
         </section>
 
+
+
         <section id="reference-panel" class="panel reference-panel" aria-labelledby="reference-title">
-          <div class="panel-heading"><div><h2 id="reference-title">References</h2><p>Review suggested boxes or draw your own.</p></div><span id="reference-count" class="count-pill">0 / 8</span></div>
-          <div class="upload-actions">
+          <div class="panel-heading"><h2 id="reference-title">Choose examples</h2><span id="reference-count" class="count-pill">0 / 8</span></div>
+          <div id="reference-upload-actions" class="upload-actions">
             <label class="upload-button primary-upload" for="reference-gallery"><span aria-hidden="true">＋</span> Choose photos</label>
             <input id="reference-gallery" type="file" accept="image/*" multiple class="visually-hidden">
             <label class="upload-button" for="reference-camera"><span aria-hidden="true">◉</span> Camera</label>
             <input id="reference-camera" type="file" accept="image/*" capture="environment" class="visually-hidden">
           </div>
-          <div id="reference-thumbs" class="thumb-list" aria-label="Reference photos"></div>
-          <div id="reference-editor" class="reference-editor" hidden>
-            <div class="editor-top"><div><strong id="editor-filename"></strong></div><button id="remove-reference" class="text-button danger" type="button">Remove</button></div>
-            <div id="drawing-surface" class="drawing-surface"><img id="editor-image" alt="Selected reference photo"><svg id="box-overlay" aria-label="Draw boxes on reference photo"></svg><div id="box-markers" class="box-markers" aria-hidden="true"></div></div>
-            <div class="editor-bottom"><span id="box-count">0 boxes</span><div class="editor-actions"><button id="auto-detect-boxes" class="text-button" type="button">Auto-detect</button><button id="undo-box" class="text-button" type="button">Undo</button></div></div>
-            <div id="box-list" class="box-list" aria-label="Reference boxes"></div>
-            <details class="coordinate-entry"><summary>Coordinates</summary><p id="coordinate-help">Pixel coordinates</p><form id="coordinate-form"><div class="coordinate-grid"><label>Left (x1)<input id="box-x1" type="number" min="0" step="1" required></label><label>Top (y1)<input id="box-y1" type="number" min="0" step="1" required></label><label>Right (x2)<input id="box-x2" type="number" min="1" step="1" required></label><label>Bottom (y2)<input id="box-y2" type="number" min="1" step="1" required></label></div><button id="add-coordinate-box" class="secondary-button" type="submit">Add box</button></form></details>
+          <div id="reference-thumbs" class="thumb-list" aria-label="Example photos"></div>
+          <div id="reference-editor" class="reference-editor" tabindex="0" role="group" aria-label="Example selection" hidden>
+            <div class="editor-top"><strong>Choose examples</strong><span id="reference-selected-count" class="reference-selected-count" aria-live="polite"></span><span id="editor-filename" class="visually-hidden"></span><div class="reference-heading-actions">
+              <button id="reference-select-areas" class="reference-area-toggle" type="button" aria-pressed="false">Mark areas</button>
+              <button id="auto-detect-boxes" class="reference-area-toggle" type="button" aria-label="Find objects in marked areas" title="Find objects in marked areas">Find objects</button>
+              <button id="remove-reference" class="reference-icon" type="button" aria-label="Remove photo" title="Remove photo"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M6 18 18 6"/></svg></button>
+            </div></div>
+            <div class="reference-review-main">
+              <div class="reference-photo-workspace">
+                <div id="reference-image-viewport" class="reference-image-viewport" tabindex="0" aria-label="Photo. Drag to draw a box, scroll to zoom, hold Alt and scroll to zoom the magnifier, or use the middle mouse button to pan.">
+                  <div id="reference-image-stage" class="reference-image-stage"><div id="drawing-surface" class="drawing-surface"><img id="editor-image" alt="Selected photo" draggable="false"><svg id="box-overlay" aria-label="Draw boxes on photo"></svg><div id="box-markers" class="box-markers"></div><div id="detection-area-markers" aria-label="Areas to search"></div></div></div>
+                </div>
+                <div class="reference-photo-toolbar">
+                  <div id="reference-selected-actions" class="reference-selected-actions" hidden><span>Selected box</span><button id="reference-selected-adjust" class="reference-icon" data-reference-action type="button" aria-label="Adjust selected box" title="Adjust selected box (E)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H3v5m13-5h5v5M3 16v5h5m8 0h5v-5"/></svg></button><button id="reference-box-remove" class="reference-icon" data-reference-action type="button" aria-label="Deselect selected box" title="Deselect (X)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M6 18 18 6"/></svg></button></div>
+                  <div class="reference-zoom-controls" role="group" aria-label="Photo zoom"><button id="reference-zoom-out" class="reference-icon" data-reference-action type="button" aria-label="Zoom out" title="Zoom out">−</button><button id="reference-zoom-reset" class="reference-zoom-reset" data-reference-action type="button" aria-label="Reset zoom to fit photo" title="Fit photo">100%</button><button id="reference-zoom-in" class="reference-icon" data-reference-action type="button" aria-label="Zoom in" title="Zoom in">+</button></div>
+                </div>
+              </div>
+              <canvas id="reference-magnifier" class="reference-magnifier" aria-hidden="true" hidden></canvas>
+              <div id="reference-inspector" class="reference-inspector" hidden>
+                <p class="reference-inspector-label">More suggestions</p><div id="reference-crop" class="reference-crop" role="img" aria-label="Enlarged suggestion"><img alt=""><div id="reference-crop-box"></div></div>
+                <div class="reference-navigation"><button id="reference-box-prev" class="reference-icon" data-reference-action type="button" aria-label="Previous suggestion" title="Previous suggestion (←)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14 6-6 6 6 6"/></svg></button><span id="reference-box-position"></span><button id="reference-box-next" class="reference-icon" data-reference-action type="button" aria-label="Next suggestion" title="Next suggestion (→)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m10 6 6 6-6 6"/></svg></button></div>
+                <div id="reference-box-actions" class="reference-box-actions">
+                  <button id="reference-box-toggle" class="reference-icon" data-reference-action type="button" aria-label="Select suggestion" title="Select suggestion and go to next (Space)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg></button>
+                  <button id="reference-box-adjust" class="reference-icon" data-reference-action type="button" aria-label="Adjust suggestion" title="Adjust this suggestion"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H3v5m13-5h5v5M3 16v5h5m8 0h5v-5"/></svg></button>
+                </div>
+              </div>
+            </div>
+            <div id="reference-selected-list" class="reference-selected-list" aria-label="Selected examples" hidden></div>
+            <p id="reference-no-proposals" class="reference-no-proposals" hidden>No suggestions. Draw a box on the photo to add one.</p>
+            <div class="reference-review-footer"><button id="undo-box" class="reference-icon" data-reference-action type="button" aria-label="Undo selection change" title="Undo (Ctrl / ⌘ Z)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 4-5 5 5 5M3 9h10a6 6 0 0 1 0 12h-2"/></svg></button><div id="reference-key-hints" class="reference-key-hints"><span><kbd>← →</kbd> Browse</span><span><kbd>Space</kbd> Select →</span><span><kbd>X</kbd> Deselect</span><span><kbd>Alt + Scroll</kbd> Magnifier</span></div>                <div id="reference-box-edit-actions" class="reference-box-actions" hidden>
+                  <button id="reference-box-save" class="reference-icon" data-reference-action type="button" aria-label="Save adjustment" title="Save (Enter)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg></button>
+                  <button id="reference-box-cancel" class="reference-icon" data-reference-action type="button" aria-label="Cancel adjustment" title="Cancel (Esc)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M6 18 18 6"/></svg></button>
+                </div><div id="reference-edit-hints" class="reference-key-hints" hidden><span><kbd>↑↓←→</kbd> Move</span><span><kbd>Shift + ↑↓←→</kbd> Resize</span><span><kbd>↵</kbd> Save</span><span><kbd>Esc</kbd> Cancel</span></div><button id="reference-done" class="reference-done" data-reference-action type="button">Done</button></div>
+            <div id="reference-announcement" class="visually-hidden" role="status" aria-live="polite" aria-atomic="true"></div>
+            <details class="coordinate-entry" hidden><summary>Coordinates</summary><p id="coordinate-help">Pixel coordinates</p><form id="coordinate-form"><div class="coordinate-grid"><label>Left (x1)<input id="box-x1" type="number" min="0" step="1" required></label><label>Top (y1)<input id="box-y1" type="number" min="0" step="1" required></label><label>Right (x2)<input id="box-x2" type="number" min="1" step="1" required></label><label>Bottom (y2)<input id="box-y2" type="number" min="1" step="1" required></label></div><button id="add-coordinate-box" class="secondary-button" type="submit">Add box</button></form></details>
           </div>
         </section>
       </div>
+
 
       <aside class="workspace-side">
         <section class="panel target-panel" aria-labelledby="target-title">
@@ -84,28 +114,43 @@
             <input id="target-camera" type="file" accept="image/*" capture="environment" class="visually-hidden">
           </div>
           <div id="target-queue" class="target-queue" aria-label="Photos ready to count"></div>
-          <button id="start-button" class="action-button" type="button">Start counting <span aria-hidden="true">→</span></button>
+          <details class="advanced"><summary>Options</summary>
+            <label class="field confidence-field">Match strength <strong id="confidence-value">0.80</strong>
+              <input id="confidence" type="range" min="0.01" max="0.95" step="0.01" value="0.80">
+              <small>For Start counting. Higher values keep only closer matches.</small>
+            </label>
+          </details>
+          <div class="count-actions"><button id="start-button" class="action-button" type="button">Start counting</button><button id="quick-count-button" class="action-button quick-action" type="button" title="Count objects in marked areas. No examples needed.">Quick count</button></div>
           <p class="quiet-note">Overlapping photos count objects again.</p>
         </section>
       </aside>
     </section>
 
     <section id="session-view" hidden aria-labelledby="session-title">
-      <div class="session-heading"><div><h2 id="session-title">Your count</h2><p id="session-subtitle"></p></div><div class="session-actions"><a id="export-link" class="secondary-button" href="#">Export CSV</a><button id="new-count-button" class="secondary-button" type="button" hidden>New count</button></div></div>
+      <div class="session-heading"><div><h2 id="session-title">Your count</h2><p id="session-subtitle"></p></div><div class="session-actions"><a id="export-link" class="secondary-button" href="#">Download results</a><button id="new-count-button" class="secondary-button" type="button" hidden>New count</button></div></div>
       <div class="metric-grid" aria-label="Count summary"><div class="metric primary-metric"><span>Total objects</span><strong id="metric-total">0</strong><small id="metric-status">Counting in progress</small></div><div class="metric"><span>Latest batch</span><strong id="metric-latest">—</strong><small id="metric-latest-note">No batch yet</small></div><div class="metric"><span>Photos counted</span><strong id="metric-images">0</strong><small id="metric-batches">0 batches</small></div></div>
+      <div id="session-reference-slot" class="session-reference-workspace"></div>
       <div class="results-grid"><div class="results-main"><div class="results-title"><h3>Results</h3><span id="results-state" class="state-pill">Ready</span></div><div id="batch-list" class="batch-list"></div></div>
         <aside id="next-batch-panel" class="panel next-batch-panel">
           <div class="panel-heading"><h2>Next batch</h2><span id="next-count" class="count-pill" aria-live="polite">0 / 20</span></div>
           <div class="upload-actions vertical"><label class="upload-button primary-upload" for="next-gallery">＋ Choose photos</label><input id="next-gallery" type="file" accept="image/*" multiple class="visually-hidden"><label class="upload-button" for="next-camera">◉ Camera</label><input id="next-camera" type="file" accept="image/*" capture="environment" class="visually-hidden"></div>
           <div id="next-queue" class="target-queue" aria-label="Next batch photos"></div>
-          <button id="upload-button" class="action-button" type="button">Count this batch <span aria-hidden="true">→</span></button>
+          <div class="count-actions"><button id="upload-button" class="action-button" type="button">Count this batch</button><button id="quick-upload-button" class="action-button quick-action" type="button" title="Count objects in marked areas. No examples needed.">Quick count</button></div>
           <p class="quiet-note">Overlapping photos count objects again.</p>
-          <div class="finish-divider"></div><button id="finish-button" class="text-button finish-button" type="button">Finish count <span aria-hidden="true">✓</span></button>
+          <div class="finish-divider"></div><button id="finish-button" class="text-button finish-button" type="button">Finish count <span aria-hidden="true">✓</span></button><p id="finish-review-hint" class="quiet-note" hidden>Review every photo before finishing.</p>
         </aside>
       </div>
     </section>
   </main>
 
-  <dialog id="image-dialog" class="image-dialog" aria-label="Enlarged result image"><div class="dialog-heading"><strong id="dialog-title"></strong><button id="close-dialog" type="button" aria-label="Close image">×</button></div><img id="dialog-image" alt="Enlarged annotated result image"></dialog>
+  <dialog id="image-dialog" class="image-dialog" aria-label="Enlarged result image"><div class="dialog-heading"><strong id="dialog-title"></strong><button id="close-dialog" type="button" aria-label="Close image">×</button></div><img id="dialog-image" alt="Enlarged photo with counted objects"></dialog>
+  <dialog id="review-dialog" class="review-dialog" aria-label="Review counted objects">
+    <div class="dialog-heading"><strong id="review-title"></strong><button id="close-review" type="button" aria-label="Close review">×</button></div>
+    <div class="review-toolbar"><span id="review-count"></span><div class="review-tools"><button id="review-add" type="button">Add box</button><button id="review-remove" type="button">Remove box</button><button id="review-pan" type="button">Move photo</button><button id="review-undo" type="button">Undo</button><button id="review-zoom-out" type="button" aria-label="Zoom out">−</button><span id="review-zoom"></span><button id="review-zoom-in" type="button" aria-label="Zoom in">+</button></div></div>
+    <div id="review-secondary-row" class="review-secondary-row" hidden><label><input id="review-show-secondary" type="checkbox"><span id="review-secondary-label">Show other suggestions</span></label><span id="review-legend">Green: counted · Orange: suggestions · Blue: other suggestions</span></div>
+    <div id="review-viewport" class="review-viewport"><div id="review-surface" class="review-surface"><img id="review-image" alt="Original photo for object review"><svg id="review-overlay" aria-label="Counted object boxes"></svg></div></div>
+    <p id="review-message" class="review-message" role="status"></p>
+    <div class="review-footer"><button id="review-reload" class="secondary-button" type="button" hidden>Reload latest</button><span id="review-status"></span><button id="review-save" class="secondary-button" type="button">Save changes</button><button id="review-confirm" class="action-button" type="button">Done reviewing</button></div>
+  </dialog>
 </body>
 </html>

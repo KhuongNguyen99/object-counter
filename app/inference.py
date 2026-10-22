@@ -11,8 +11,9 @@ from uuid import uuid4
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-from .models import (COUNTGD_MODEL_ID, PETDINO_MODEL_ID, SAM3COUNT_MODEL_ID, checkpoint_path,
-                     countgd_dir, petdino_dir, sam3count_dir, validate_checkpoint)
+from .models import (COUNTGD_MODEL_ID, CROSSCHECK_MODEL_ID, FASTSAM_FILENAME, FASTSAM_MODEL_ID, PETDINO_MODEL_ID,
+                     SAM3COUNT_MODEL_ID, SAM3_MODEL_ID, checkpoint_path, model_dir, countgd_dir,
+                     petdino_dir, sam3count_dir, validate_checkpoint)
 from .tiling import make_tiles, merge_tile_detections
 
 
@@ -74,7 +75,7 @@ class InferenceEngine:
     def __init__(self) -> None:
         self._model = None
         self._model_id = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     @staticmethod
     def _device():
@@ -107,15 +108,22 @@ class InferenceEngine:
             self._model_id = COUNTGD_MODEL_ID
         return self._model
 
-    def suggest_reference_boxes(self, image_path: str, label: str) -> dict:
+    def suggest_reference_boxes(self, image_path: str, label: str = "") -> dict:
         """Propose editable boxes using the same lock and one-model cache as counting."""
         with self._lock:
             from .reference import ReferenceModelUnavailable, propose_boxes
             try:
-                core = self._load_countgd_model(self._device())
+                if self._model_id != FASTSAM_MODEL_ID or self._model is None:
+                    path = model_dir() / FASTSAM_FILENAME
+                    validate_checkpoint(path)
+                    from ultralytics import FastSAM
+
+                    self._unload_model()
+                    self._model = FastSAM(str(path))
+                    self._model_id = FASTSAM_MODEL_ID
             except (FileNotFoundError, ValueError, ImportError) as exc:
-                raise ReferenceModelUnavailable("CountGD++ reference model is unavailable") from exc
-            return propose_boxes(core, image_path, label)
+                raise ReferenceModelUnavailable("FastSAM reference model is unavailable") from exc
+            return propose_boxes(self._model, image_path, self._device())
 
     def _load_model(self, model_id: str):
         path = checkpoint_path(model_id)
@@ -143,6 +151,9 @@ class InferenceEngine:
         output_dir: str,
         confidence: float = 0.25,
         label: str = "",
+        *,
+        reference_strategy: str = "mean",
+        reference_mode: str = "shared",
     ) -> list[dict]:
         """Combine exemplars once, then infer each target at native pixel resolution.
 
@@ -152,15 +163,69 @@ class InferenceEngine:
         """
         if not math.isfinite(confidence) or not 0 <= confidence <= 1:
             raise ValueError("Confidence must be between 0 and 1.")
+        if reference_strategy not in ("mean", "per-object"):
+            raise ValueError("Reference strategy must be mean or per-object.")
+        if reference_strategy == "per-object" and not model_id.startswith("yoloe-"):
+            raise ValueError("Per-object reference strategy is supported only for YOLOE.")
+        if reference_mode not in ("shared", "per_image") or (reference_mode == "per_image" and model_id != COUNTGD_MODEL_ID):
+            raise ValueError("Per-image reference mode is supported only for CountGD++.")
         if not image_paths or (not references and model_id != SAM3COUNT_MODEL_ID):
             raise ValueError("Provide reference boxes and at least one image to count.")
+        if model_id == COUNTGD_MODEL_ID and reference_mode == "per_image":
+            if len(references) != len(image_paths):
+                raise ValueError("CountGD++ needs one set of reference boxes for each image to count.")
+            for reference, image_path in zip(references, image_paths, strict=True):
+                if (not isinstance(reference, dict) or not isinstance(reference.get("path"), str) or
+                        not Path(reference["path"]).is_absolute() or
+                        Path(reference["path"]).resolve() != Path(image_path).resolve()):
+                    raise ValueError("Each CountGD++ reference path must match its target image.")
+                if not isinstance(reference.get("boxes"), list) or len(reference["boxes"]) != 10:
+                    raise ValueError("Each CountGD++ target image needs exactly 10 distinct boxes.")
+                boxes = reference["boxes"]
+                if any(not isinstance(box, list) or len(box) != 4 or
+                       any(isinstance(n, bool) or not isinstance(n, (int, float)) or
+                           (isinstance(n, float) and not math.isfinite(n)) for n in box)
+                       for box in boxes):
+                    raise ValueError("CountGD++ boxes need four finite numeric pixel coordinates.")
+                if len({tuple(box) for box in boxes}) != 10:
+                    raise ValueError("Each CountGD++ target image needs exactly 10 distinct boxes.")
+                image = _read_image(image_path)
+                _reference_boxes(boxes, *image.size)
         if model_id == SAM3COUNT_MODEL_ID and (references or not label.strip()):
             raise ValueError("SAM3Count requires an Object description and no reference photos.")
+        if model_id == SAM3_MODEL_ID:
+            from .sam3visual import _sam3_reference_boxes
+
+            if len(references) != len(image_paths):
+                raise ValueError("SAM3 needs one set of reference boxes for each image to count.")
+            for reference, image_path in zip(references, image_paths, strict=True):
+                if (not isinstance(reference, dict) or
+                        not isinstance(reference.get("path"), str) or
+                        not Path(reference["path"]).is_absolute() or
+                        Path(reference["path"]).resolve() != Path(image_path).resolve()):
+                    raise ValueError("Each SAM3 reference path must match its target image.")
+                image = _read_image(image_path)
+                _sam3_reference_boxes(reference.get("boxes"), *image.size)
         directory = Path(output_dir).resolve()
         directory.mkdir(parents=True, exist_ok=True)
         with self._lock:
+            if model_id == CROSSCHECK_MODEL_ID:
+                return self._count_crosscheck(references, image_paths, str(directory), confidence, label)
             import torch
             device = self._device()
+            if model_id == SAM3_MODEL_ID:
+                if self._model_id != SAM3_MODEL_ID or self._model is None:
+                    from .sam3visual import Sam3VisualEngine
+
+                    self._unload_model()
+                    self._model = Sam3VisualEngine(sam3count_dir(),
+                                                   f"cuda:{device}" if device.isdigit() else device)
+                    self._model_id = SAM3_MODEL_ID
+                try:
+                    return self._model.count(references, image_paths, str(directory), confidence)
+                except Exception:
+                    self._unload_model()
+                    raise
             if model_id == SAM3COUNT_MODEL_ID:
                 if self._model_id != SAM3COUNT_MODEL_ID or self._model is None:
                     from .sam3count import Sam3CountEngine
@@ -173,8 +238,11 @@ class InferenceEngine:
                     self._unload_model()
                     raise
             if model_id == COUNTGD_MODEL_ID:
-                return self._load_countgd_model(device).count(
-                    references, image_paths, str(directory), confidence, label)
+                model = self._load_countgd_model(device)
+                if reference_mode == "per_image":
+                    return [result for reference, image_path in zip(references, image_paths, strict=True)
+                            for result in model.count([reference], [image_path], str(directory), confidence, label)]
+                return model.count(references, image_paths, str(directory), confidence, label)
             if model_id == PETDINO_MODEL_ID:
                 if self._model_id != PETDINO_MODEL_ID or self._model is None:
                     from .petdino import PetDINOEngine
@@ -204,19 +272,24 @@ class InferenceEngine:
                 for reference in references:
                     image = _read_image(reference["path"])
                     boxes = _reference_boxes(reference["boxes"], *image.size)
-                    # Unique temporary IDs preserve every box; only the pooled class is used for detection.
+                    # Unique temporary IDs preserve every box before the selected pooling strategy.
                     encoder.set_prompts({"bboxes": boxes, "cls": np.arange(len(boxes), dtype=np.int32)})
                     embedding = encoder.get_vpe(image)
-                    if embedding.shape[:2] != (1, len(boxes)) or not torch.isfinite(embedding).all():
+                    if (embedding.ndim != 3 or embedding.shape[:2] != (1, len(boxes)) or
+                            embedding.shape[-1] == 0 or not torch.isfinite(embedding).all()):
                         raise RuntimeError("The model returned invalid visual-reference embeddings.")
                     embeddings.append(embedding)
-                pooled = torch.cat(embeddings, dim=1).mean(dim=1, keepdim=True)
-                if pooled.norm().item() < 1e-8:
+                prototypes = torch.cat(embeddings, dim=1)
+                if reference_strategy == "mean":
+                    # Standard counting follows Ultralytics' multi-image visual validation.
+                    prototypes = prototypes.mean(dim=1, keepdim=True)
+                if (prototypes.norm(dim=-1) < 1e-8).any():
                     raise ValueError("These reference boxes did not produce a usable object embedding.")
-                # This follows Ultralytics' multi-image visual validation: mean, then L2 normalize.
-                pooled = torch.nn.functional.normalize(pooled, p=2, dim=-1)
+                prototypes = torch.nn.functional.normalize(prototypes, p=2, dim=-1)
                 del encoder, embeddings
-                model.set_classes(["object"], embeddings=pooled)
+                classes = (["object"] if reference_strategy == "mean" else
+                           [f"object-{i}" for i in range(prototypes.shape[1])])
+                model.set_classes(classes, embeddings=prototypes)
 
                 outputs = []
                 for image_path in image_paths:
@@ -268,3 +341,39 @@ class InferenceEngine:
                     elif not detections:
                         outputs[-1]["warning"] = "No matches detected. Check the reference or use a model trained for this object."
                 return outputs
+
+    def _count_crosscheck(self, references, image_paths, output_dir, confidence, label):
+        from .verification import compare_detections
+
+        started = time.perf_counter()
+        primary = self.count(COUNTGD_MODEL_ID, references, image_paths, output_dir, confidence, label)
+        try:
+            secondary = self.count("yoloe-26x-seg", references, image_paths, output_dir, .01, label,
+                                   reference_strategy="per-object")
+            if len(primary) != len(secondary):
+                raise ValueError("Cross-check returned the wrong number of images")
+            comparisons = [{**compare_detections(a["detections"], b["detections"], COUNTGD_MODEL_ID,
+                                                "yoloe-26x-seg", confidence, .01),
+                            "primary_elapsed_ms": a["elapsed_ms"],
+                            "secondary_elapsed_ms": b["elapsed_ms"],
+                            "secondary_warning": b.get("warning")}
+                           for a, b in zip(primary, secondary, strict=True)]
+        except Exception as exc:
+            # A failed check must not erase a usable primary result or imply agreement.
+            comparisons = [{"status": "failed", "primary_model": COUNTGD_MODEL_ID,
+                            "secondary_model": "yoloe-26x-seg", "primary_confidence": confidence,
+                            "secondary_confidence": .01, "primary_count": result["count"],
+                            "primary_elapsed_ms": result["elapsed_ms"], "secondary_elapsed_ms": None,
+                            "error": str(exc)[:300]} for result in primary]
+            self._unload_model()
+        batch_wall_ms = round((time.perf_counter() - started) * 1000, 2)
+        for result, comparison in zip(primary, comparisons, strict=True):
+            comparison["secondary_reference_strategy"] = "per-object"
+            # Sum per-image inference/annotation times; batch wall time also includes model setup.
+            result["elapsed_ms"] = round(comparison["primary_elapsed_ms"] +
+                                         (comparison["secondary_elapsed_ms"] or 0), 2)
+            result["verification"] = comparison
+            result["warning"] = ((result.get("warning") or "") +
+                                 " Cross-check requires image review; both models can miss the same object.").strip()
+            comparison["batch_wall_ms"] = batch_wall_ms
+        return primary

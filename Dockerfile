@@ -31,53 +31,17 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-# PET-DINO's compiled MMCV operators use the upstream torch 2.1 CUDA ABI.
-# Keep them separate from CountGD++/YOLOE's torch 2.9 environment.
-FROM dependencies AS petdino-dependencies
-RUN python -m venv /opt/petdino-venv
-RUN --mount=type=cache,target=/root/.cache/pip \
-    env -u PIP_NO_CACHE_DIR /opt/petdino-venv/bin/pip install --timeout 120 --retries 5 pip==25.3 \
-    && env -u PIP_NO_CACHE_DIR /opt/petdino-venv/bin/pip download --timeout 120 --retries 5 --resume-retries 5 \
-        --no-deps --dest /tmp/petdino-torch-wheels torch==2.1.0+cu121 torchvision==0.16.0+cu121 \
-        --index-url https://download.pytorch.org/whl/cu121 \
-    && env -u PIP_NO_CACHE_DIR /opt/petdino-venv/bin/pip install --timeout 120 --retries 5 --resume-retries 5 \
-        /tmp/petdino-torch-wheels/*.whl \
-    && rm -rf /tmp/petdino-torch-wheels
-COPY requirements-petdino.txt .
-RUN --mount=type=cache,target=/root/.cache/pip \
-    env -u PIP_NO_CACHE_DIR /opt/petdino-venv/bin/pip install --timeout 120 --retries 5 --resume-retries 5 \
-        -r requirements-petdino.txt \
-    && env -u PIP_NO_CACHE_DIR /opt/petdino-venv/bin/pip install --timeout 120 --retries 5 --resume-retries 5 \
-        'https://download.openmmlab.com/mmcv/dist/cu121/torch2.1.0/mmcv-2.1.0-cp311-cp311-manylinux1_x86_64.whl#sha256=e0ee80f8f86e4227eb58636406517a92699a806db427846cceb2ad28ecd73243'
-COPY scripts/prepare_petdino.py /tmp/prepare_petdino.py
-RUN python /tmp/prepare_petdino.py --source-only \
-    && /opt/petdino-venv/bin/pip install --no-deps --no-build-isolation -e /opt/petdino \
-    && /opt/petdino-venv/bin/python -c "import mmdet; from mmcv.ops import MultiScaleDeformableAttention, roi_align"
-
-FROM petdino-dependencies AS sam3count-dependencies
-USER root
-ENV SAM3_SOURCE_DIR=/opt/sam3 \
-    SAM3COUNT_SOURCE_DIR=/opt/sam3count
-COPY requirements-sam3count.txt /tmp/requirements-sam3count.txt
-RUN pip install -r /tmp/requirements-sam3count.txt
-COPY scripts/prepare_sam3count.py /tmp/prepare_sam3count.py
-RUN python /tmp/prepare_sam3count.py --source-only \
-    && PYTHONPATH=/opt/sam3 python -c "from sam3.model_builder import build_sam3_image_model"
-
 FROM scratch AS model-assets
-COPY models /app/models
-FROM sam3count-dependencies AS runtime
+COPY models/countgd /app/models/countgd
+COPY models/FastSAM-s.pt /app/models/FastSAM-s.pt
+FROM dependencies AS runtime
 ENTRYPOINT []
-ENV PETDINO_SOURCE_DIR=/opt/petdino \
-    PETDINO_PYTHON=/opt/petdino-venv/bin/python
 COPY app /app/app
 COPY scripts /app/scripts
 COPY --from=model-assets /app/models /app/models
 # Check all cached weights; fetch missing official checkpoints during the build.
-RUN python scripts/download_models.py --model-dir /app/models \
+RUN python scripts/download_models.py --model-dir /app/models --models FastSAM-s \
     && HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 python scripts/prepare_countgd.py \
-    && python scripts/prepare_petdino.py --assets-only \
-    && python scripts/prepare_sam3count.py --verify-only \
     && mkdir -p /app/data && chown -R counter:counter /app/data
 USER counter
 EXPOSE 8080

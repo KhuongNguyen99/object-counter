@@ -5,6 +5,7 @@ import hashlib
 from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
+import zipfile
 
 import numpy as np
 import pytest
@@ -30,6 +31,26 @@ def test_countgd_assets_reject_missing_or_modified_checkpoint(tmp_path, monkeypa
         models.validate_countgd_assets(tmp_path)
 
 
+def test_fastsam_checkpoint_rejects_missing_or_same_length_modified_asset(tmp_path, monkeypatch):
+    from app import models
+
+    checkpoint = tmp_path / models.FASTSAM_FILENAME
+    with zipfile.ZipFile(checkpoint, "w") as archive:
+        archive.writestr("checkpoint", b"trusted official checkpoint")
+    contents = checkpoint.read_bytes()
+    monkeypatch.setattr(models, "FASTSAM_ASSETS", {
+        models.FASTSAM_FILENAME: (len(contents), hashlib.sha256(contents).hexdigest()),
+    })
+    checkpoint.unlink()
+    with pytest.raises(FileNotFoundError, match="download_models"):
+        models.validate_checkpoint(checkpoint)
+    checkpoint.write_bytes(contents)
+    models.validate_checkpoint(checkpoint)
+    checkpoint.write_bytes(b"x" * len(contents))
+    with pytest.raises(ValueError, match="SHA-256"):
+        models.validate_checkpoint(checkpoint)
+
+
 def test_reference_boxes_reject_invalid_coordinates():
     for boxes in ([], [[1, 2, 1, 5]], [[-1, 0, 4, 4]], [[0, 0, 101, 3]], [[0, 0, float("nan"), 4]]):
         with pytest.raises(ValueError):
@@ -37,14 +58,16 @@ def test_reference_boxes_reject_invalid_coordinates():
     np.testing.assert_equal(_reference_boxes([[0, 0, 100, 50]], 100, 50), [[0, 0, 100, 50]])
 
 
-def test_model_catalog_is_latest_family_and_requires_local_checkpoints(tmp_path, monkeypatch):
+def test_model_catalog_only_offers_countgd_and_requires_local_checkpoints(tmp_path, monkeypatch):
     monkeypatch.setenv("MODEL_DIR", str(tmp_path))
     models = list_models()
-    yoloe_models = [model for model in models if model["family"] == "YOLOE-26"]
-    assert len(yoloe_models) == 5
-    assert {model["size"] for model in yoloe_models} == {"n", "s", "m", "l", "x"}
-    assert [model["id"] for model in models if model["family"] == "CountGD++"] == ["countgd-plusplus"]
-    assert all(not model["available"] for model in models)
+    assert len(models) == 1
+    countgd = models[0]
+    assert countgd["id"] == "countgd-plusplus"
+    assert countgd["default_confidence"] == .80
+    assert countgd["reference_mode"] == "per_image"
+    assert countgd["required_reference_boxes"] == 10
+    assert not countgd["available"]
     with pytest.raises(ValueError):
         checkpoint_path("../../untrusted")
     with pytest.raises(FileNotFoundError, match="download_models"):
@@ -55,13 +78,71 @@ def test_model_catalog_is_latest_family_and_requires_local_checkpoints(tmp_path,
         validate_checkpoint(fake)
 
 
+def test_countgd_per_image_runs_one_conditioning_call_per_target(tmp_path, monkeypatch):
+    first = _fixture_image(tmp_path / "first.png", (16, 12))
+    second = _fixture_image(tmp_path / "second.png", (16, 12))
+    third = _fixture_image(tmp_path / "third.png", (16, 12))
+    references = [{"path": first, "boxes": [[i, 1, i + 4, 5] for i in range(1, 11)]},
+                  {"path": second, "boxes": [[i, 2, i + 4, 6] for i in range(1, 11)]}]
+
+    class FakeCountGD:
+        def __init__(self):
+            self.calls = []
+
+        def count(self, refs, paths, output_dir, confidence, label):
+            self.calls.append((refs, paths, output_dir, confidence, label))
+            return [{"source": paths[0], "boxes": refs[0]["boxes"]}]
+
+    model = FakeCountGD()
+    engine = InferenceEngine()
+    monkeypatch.setattr(engine, "_device", lambda: "cpu")
+    monkeypatch.setattr(engine, "_load_countgd_model", lambda device: model)
+    result = engine.count("countgd-plusplus", references, [first, second], str(tmp_path / "out"),
+                          label="", reference_mode="per_image")
+    assert [item["source"] for item in result] == [first, second]
+    assert len(model.calls) == 2
+    assert [(refs[0]["path"], paths) for refs, paths, *_ in model.calls] == [
+        (first, [first]), (second, [second])]
+    assert [refs[0]["boxes"] for refs, *_ in model.calls] == [ref["boxes"] for ref in references]
+    assert all(len(refs) == 1 for refs, *_ in model.calls)
+
+    later = {"path": third, "boxes": [[i, 3, i + 4, 7] for i in range(1, 11)]}
+    engine.count("countgd-plusplus", [later], [third], str(tmp_path / "out"),
+                 reference_mode="per_image")
+    assert model.calls[-1][0] == [later] and model.calls[-1][1] == [third]
+
+
+@pytest.mark.parametrize("bad_references", [
+    lambda first, second: [{"path": first, "boxes": [[1, 1, 8, 8]] * 9}],
+    lambda first, second: [{"path": first, "boxes": [[1, 1, 8, 8]] * 11}],
+    lambda first, second: [{"path": first, "boxes": [[1, 1, 8, 8]] * 10}],
+    lambda first, second: [{"path": first, "boxes": [[True, 1, 8, 8]] +
+                           [[i, 1, i + 4, 5] for i in range(2, 11)]}],
+    lambda first, second: [{"path": first, "boxes": [["1", 1, 8, 8]] +
+                           [[i, 1, i + 4, 5] for i in range(2, 11)]}],
+    lambda first, second: [{"path": second, "boxes": [[1, 1, 8, 8]] * 10}],
+    lambda first, second: [{"path": first, "boxes": [[1, 1, 8, 8]] * 10},
+                           {"path": second, "boxes": [[1, 1, 8, 8]] * 10}],
+])
+def test_countgd_per_image_rejects_invalid_references_before_model_load(tmp_path, monkeypatch,
+                                                                         bad_references):
+    first = _fixture_image(tmp_path / "first.png", (16, 12))
+    second = _fixture_image(tmp_path / "second.png", (16, 12))
+    engine = InferenceEngine()
+    monkeypatch.setattr(engine, "_device", lambda: pytest.fail("device selected before validation"))
+    monkeypatch.setattr(engine, "_load_countgd_model", lambda _: pytest.fail("model loaded before validation"))
+    with pytest.raises(ValueError, match="CountGD"):
+        engine.count("countgd-plusplus", bad_references(first, second), [first], str(tmp_path / "out"),
+                     reference_mode="per_image")
+
+
 @pytest.fixture
 def fake_yoloe(monkeypatch):
     """Exercise the real count/load loop with a cheap fake YOLOE and visual encoder."""
     import torch
     from app import inference
 
-    state = SimpleNamespace(models=[], encoder_calls=0, prompts=[], predict_fn=lambda source: [])
+    state = SimpleNamespace(models=[], encoder_calls=0, prompts=[], predict_fn=lambda source: [], embedding_fn=None)
 
     class FakeEncoder:
         def __init__(self, overrides):
@@ -76,6 +157,8 @@ def fake_yoloe(monkeypatch):
 
         def get_vpe(self, image):
             state.encoder_calls += 1
+            if state.embedding_fn is not None:
+                return state.embedding_fn(self.prompts["bboxes"])
             left = torch.as_tensor(self.prompts["bboxes"][:, 0], dtype=torch.float32)
             return torch.stack((torch.ones_like(left), left + 1), dim=-1).unsqueeze(0)
 
@@ -86,17 +169,20 @@ def fake_yoloe(monkeypatch):
             self.predictor = None
             self.calls = []
             self.embeddings = []
+            self.classes = []
             state.models.append(self)
 
         def set_classes(self, classes, embeddings):
-            assert classes == ["object"]
+            assert classes == ["object"] or classes == [f"object-{i}" for i in range(embeddings.shape[1])]
             self.model.pe = embeddings
             self.embeddings.append(embeddings.clone())
+            self.classes.append(list(classes))
 
         def predict(self, source, **options):
-            assert self.model.pe.shape[1] == 1
+            assert self.model.pe.shape[1] == len(self.classes[-1])
             assert options["imgsz"] >= max(source.size)
             assert options["max_det"] >= 1
+            assert options["nms"] and options["agnostic_nms"] and options["iou"] == .5
             self.calls.append((source.copy(), options.copy()))
             records = state.predict_fn(source)
             boxes = torch.tensor([box for box, _ in records], dtype=torch.float32).reshape(-1, 4)
@@ -174,58 +260,118 @@ def test_yoloe_prompt_encoded_once_per_batch_and_reset_between_runs(tmp_path, fa
     assert not np.allclose(first_prompt.numpy(), model.embeddings[1].numpy())
 
 
-def test_reference_proposals_reuse_countgd_core_and_reload_after_yoloe(tmp_path, fake_yoloe, monkeypatch):
-    from app import countgd, reference
+def test_per_object_matches_frozen_tensor_recipe_and_next_normal_run_uses_mean(tmp_path, fake_yoloe):
+    import torch
+
+    source = _fixture_image(tmp_path / "wide.png", (100, 64))
+    refs = [{"path": source, "boxes": [[2, 2, 12, 12], [10, 2, 20, 12]]},
+            {"path": source, "boxes": [[20, 2, 30, 12]]}]
+    groups = [torch.tensor([[[1., 3.], [1., 11.]]]), torch.tensor([[[1., 21.]]])]
+    expected = torch.nn.functional.normalize(torch.cat(groups, dim=1), p=2, dim=-1)
+    engine = InferenceEngine()
+    per_object = engine.count("yoloe-26x-seg", refs, [source, source], str(tmp_path / "out"),
+                              reference_strategy="per-object")
+    model = fake_yoloe.models[0]
+    torch.testing.assert_close(model.embeddings[-1], expected, rtol=0, atol=0)
+    assert model.classes[-1] == ["object-0", "object-1", "object-2"]
+    assert fake_yoloe.encoder_calls == 2 and len(model.calls) == 4
+    assert all(result["processing"]["tiles"] == 2 for result in per_object)
+    engine.count("yoloe-26x-seg", refs, [source], str(tmp_path / "out"))
+    expected_mean = torch.nn.functional.normalize(torch.cat(groups, dim=1).mean(1, keepdim=True), p=2, dim=-1)
+    assert len(fake_yoloe.models) == 1 and fake_yoloe.encoder_calls == 4
+    assert model.classes[-1] == ["object"]
+    torch.testing.assert_close(model.embeddings[-1], expected_mean, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("bad_vector", [[0., 0.], [float("nan"), 1.]])
+def test_per_object_rejects_unusable_individual_prototypes(tmp_path, fake_yoloe, bad_vector):
+    import torch
 
     source = _fixture_image(tmp_path / "small.png", (32, 32))
-    state = SimpleNamespace(proposals=[], countgd=[])
+    fake_yoloe.embedding_fn = lambda boxes: torch.tensor([[[1., 2.], bad_vector]])
+    with pytest.raises((ValueError, RuntimeError), match="embedding"):
+        InferenceEngine().count("yoloe-26x-seg",
+                                [{"path": source, "boxes": [[2, 2, 12, 12], [20, 2, 30, 12]]}],
+                                [source], str(tmp_path / "out"), reference_strategy="per-object")
+    assert not fake_yoloe.models[0].calls and not fake_yoloe.models[0].embeddings
 
-    def fake_propose(core, image_path, label):
-        assert core is state.countgd[-1] and image_path == source
-        state.proposals.append(label)
+
+@pytest.mark.parametrize("model,strategy", [("yoloe-26x-seg", "unknown"), ("countgd-plusplus", "per-object")])
+def test_reference_strategy_validation_precedes_model_loading(tmp_path, model, strategy):
+    with pytest.raises(ValueError, match="[Ss]trategy"):
+        InferenceEngine().count(model, [{"path": "unused", "boxes": []}], ["unused"], str(tmp_path),
+                                reference_strategy=strategy)
+
+
+def test_reference_proposals_reuse_fastsam_and_reload_after_yoloe(tmp_path, fake_yoloe, monkeypatch):
+    from app import inference, reference
+
+    source = _fixture_image(tmp_path / "small.png", (32, 32))
+    state = SimpleNamespace(proposals=[], fastsam=[], validated=[], closed=[])
+
+    def fake_propose(model, image_path, device):
+        assert model is state.fastsam[-1] and image_path == source and device == "cpu"
+        state.proposals.append(model)
         return {"width": 32, "height": 32, "boxes": [[1, 1, 10, 10]],
-                "model": "countgd-plusplus", "elapsed_ms": 1, "warning": None}
+                "model": "fastsam-s", "elapsed_ms": 1, "warning": None}
 
-    class FakeCountGD:
-        def __init__(self, directory, device):
-            self.device = device
-            state.countgd.append(self)
+    class FakeFastSAM:
+        def __init__(self, path):
+            assert path == str(tmp_path / "FastSAM-s.pt")
+            assert state.validated[-1] == tmp_path / "FastSAM-s.pt"
+            state.fastsam.append(self)
 
-        def count(self, *args):
-            return []
+        def close(self):
+            state.closed.append(self)
 
+    def validate(path):
+        if path.name == "FastSAM-s.pt":
+            state.validated.append(path)
+
+    monkeypatch.setattr(inference, "model_dir", lambda: tmp_path)
+    monkeypatch.setattr(inference, "validate_checkpoint", validate)
+    monkeypatch.setattr(sys.modules["ultralytics"], "FastSAM", FakeFastSAM, raising=False)
     monkeypatch.setattr(reference, "propose_boxes", fake_propose, raising=False)
-    monkeypatch.setattr(countgd, "CountGDEngine", FakeCountGD)
     engine = InferenceEngine()
     refs = [{"path": source, "boxes": [[2, 2, 12, 12]]}]
     fake_yoloe.predict_fn = lambda crop: []
     engine.count("yoloe-26n-seg", refs, [source], str(tmp_path / "out"))
     assert engine._model_id == "yoloe-26n-seg" and len(fake_yoloe.models) == 1
     assert engine.suggest_reference_boxes(source, "rings")["boxes"] == [[1, 1, 10, 10]]
-    assert engine._model_id == "countgd-plusplus" and len(state.countgd) == 1
-    assert state.countgd[0].device == "cpu"
-    engine.suggest_reference_boxes(source, "bolts")
-    assert len(state.countgd) == 1
-    engine.count("countgd-plusplus", refs, [source], str(tmp_path / "out"))
-    assert engine._model_id == "countgd-plusplus" and len(state.countgd) == 1
-    engine.suggest_reference_boxes(source, "nuts")
-    assert len(state.countgd) == 1 and state.proposals == ["rings", "bolts", "nuts"]
+    assert engine._model_id == "fastsam-s" and len(state.fastsam) == 1
+    engine.suggest_reference_boxes(source)
+    assert len(state.fastsam) == 1 and state.proposals == [state.fastsam[0]] * 2
+    assert state.validated == [tmp_path / "FastSAM-s.pt"]
     engine.count("yoloe-26n-seg", refs, [source], str(tmp_path / "out"))
     assert engine._model_id == "yoloe-26n-seg" and len(fake_yoloe.models) == 2
+    assert state.closed == [state.fastsam[0]]
     engine.suggest_reference_boxes(source, "washers")
-    assert engine._model_id == "countgd-plusplus" and len(state.countgd) == 2
+    assert engine._model_id == "fastsam-s" and len(state.fastsam) == 2
+    assert state.proposals[-1] is state.fastsam[1]
+    assert state.validated == [tmp_path / "FastSAM-s.pt"] * 2
 
 
 @pytest.mark.parametrize("failure", [FileNotFoundError("missing"), ValueError("corrupt"), ImportError("package")])
-def test_reference_model_load_failures_are_unavailable(tmp_path, monkeypatch, failure):
-    from app import countgd, reference
+def test_reference_model_load_failures_are_unavailable(tmp_path, fake_yoloe, monkeypatch, failure):
+    from app import inference, reference
 
-    def failing_countgd(*args):
+    loaded = []
+
+    def validate(path):
+        assert path == tmp_path / "FastSAM-s.pt"
+        if not isinstance(failure, ImportError):
+            raise failure
+
+    def failing_fastsam(path):
+        loaded.append(path)
         raise failure
 
-    monkeypatch.setattr(countgd, "CountGDEngine", failing_countgd)
-    with pytest.raises(reference.ReferenceModelUnavailable):
+    monkeypatch.setattr(inference, "model_dir", lambda: tmp_path)
+    monkeypatch.setattr(inference, "validate_checkpoint", validate)
+    monkeypatch.setattr(sys.modules["ultralytics"], "FastSAM", failing_fastsam, raising=False)
+    with pytest.raises(reference.ReferenceModelUnavailable, match="FastSAM"):
         InferenceEngine().suggest_reference_boxes(str(tmp_path / "image.jpg"), "rings")
+    assert loaded == ([str(tmp_path / "FastSAM-s.pt")] if isinstance(failure, ImportError) else [])
 
 
 def test_yoloe_detection_limit_is_per_tile_and_zero_warning_survives(tmp_path, fake_yoloe, monkeypatch):

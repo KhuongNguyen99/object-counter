@@ -94,6 +94,29 @@ class _Detection:
     record: dict
 
 
+def _thin_fragment_agrees(a: _Detection, b: _Detection, common: Box, containment: float) -> bool:
+    """A small edge-coordinate error must not dominate a thin-strip IoU."""
+    complete, fragment = (a, b) if not any(a.clipped) else (b, a)
+    if any(complete.clipped) or sum(fragment.clipped) != 1 or containment < .85:
+        return False
+    side = fragment.clipped.index(True)
+    axis, other = side % 2, 1 - side % 2
+    full_size = complete.box[axis + 2] - complete.box[axis]
+    boundary = fragment.tile.box[side]
+    if not complete.box[axis] + 2 < boundary < complete.box[axis + 2] - 2:
+        return False
+    visible = [_intersection(detection.box, common) for detection in (complete, fragment)]
+    if max(box[axis + 2] - box[axis] for box in visible) > .35 * full_size:
+        return False
+    # Their untruncated dimension must still agree; a contained small object
+    # cannot inherit the identity of a substantially longer complete object.
+    overlap = (min(complete.box[other + 2], fragment.box[other + 2])
+               - max(complete.box[other], fragment.box[other]))
+    extent = (max(complete.box[other + 2], fragment.box[other + 2])
+              - min(complete.box[other], fragment.box[other]))
+    return overlap / extent >= .65
+
+
 def _match(a: _Detection, b: _Detection, common: Box) -> float:
     """Return association strength, or zero for incompatible predictions."""
     overlap = _iou(a.box, b.box)
@@ -121,8 +144,11 @@ def _match(a: _Detection, b: _Detection, common: Box) -> float:
         # a foot below the shared strip can widen the lower person's box. Strong
         # shared overlap still establishes continuity across opposite crop edges.
         return 2 + agreement
+    thin_fragment = False
     if agreement < .5 or (agreement < .65 and containment < .85):
-        return 0.
+        thin_fragment = _thin_fragment_agrees(a, b, common, containment)
+        if not thin_fragment:
+            return 0.
     tolerances = (
         max(2., .35 * max(a.box[2] - a.box[0], b.box[2] - b.box[0])),
         max(2., .35 * max(a.box[3] - a.box[1], b.box[3] - b.box[1])),
@@ -136,16 +162,16 @@ def _match(a: _Detection, b: _Detection, common: Box) -> float:
                 return 0.
     # Exact partial views must outrank an ordinary high-IoU pair belonging to
     # different overlapping objects. Rank by agreement in the shared view.
-    return 2 + agreement
+    return (1 if thin_fragment else 2) + agreement
 
 
 def _stronger_view(strong: _Detection, weak: _Detection) -> bool:
-    """A substantially broader observation can explain a clipped fragment."""
+    """A complete or substantially broader observation can explain a clipped fragment."""
     weak_area = _area(weak.box)
     return (
         any(weak.clipped)
         and sum(strong.clipped) <= sum(weak.clipped)
-        and _area(strong.box) >= 1.5 * weak_area
+        and _area(strong.box) >= (1. if not any(strong.clipped) else 1.5) * weak_area
         and _area(_intersection(strong.box, weak.box)) >= .85 * weak_area
     )
 

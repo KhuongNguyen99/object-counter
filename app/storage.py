@@ -6,6 +6,8 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .models import CROSSCHECK_MODEL_ID
+
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
@@ -37,7 +39,7 @@ class Store:
                     original_filename TEXT NOT NULL, sha256 TEXT NOT NULL,
                     count INTEGER, detections TEXT, annotated_filename TEXT,
                     width INTEGER NOT NULL, height INTEGER NOT NULL, elapsed_ms REAL,
-                    warning TEXT, processing TEXT
+                    warning TEXT, processing TEXT, reference_boxes TEXT
                 );
                 CREATE INDEX IF NOT EXISTS refs_session ON refs(session_id);
                 CREATE INDEX IF NOT EXISTS batches_session ON batches(session_id);
@@ -48,6 +50,19 @@ class Store:
                 db.execute("ALTER TABLE images ADD COLUMN warning TEXT")
             if "processing" not in columns:
                 db.execute("ALTER TABLE images ADD COLUMN processing TEXT")
+            if "reference_boxes" not in columns:
+                db.execute("ALTER TABLE images ADD COLUMN reference_boxes TEXT")
+            if "search_areas" not in columns:
+                db.execute("ALTER TABLE images ADD COLUMN search_areas TEXT")
+            batch_columns = {column["name"] for column in db.execute("PRAGMA table_info(batches)")}
+            if "count_mode" not in batch_columns:
+                db.execute("ALTER TABLE batches ADD COLUMN count_mode TEXT NOT NULL DEFAULT 'standard'")
+            for name, definition in {
+                "verification": "TEXT", "review_detections": "TEXT", "review_annotated_filename": "TEXT",
+                "review_revision": "INTEGER NOT NULL DEFAULT 0", "reviewed_at": "TEXT",
+            }.items():
+                if name not in columns:
+                    db.execute(f"ALTER TABLE images ADD COLUMN {name} {definition}")
             db.execute("UPDATE batches SET status='failed', error=? WHERE status IN ('queued', 'running')",
                        ("Server restarted before this batch finished. Please retry the images.",))
 
@@ -78,7 +93,7 @@ class Store:
         with self.connection() as db:
             return db.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
 
-    def create_batch(self, session_id, batch_id, images):
+    def create_batch(self, session_id, batch_id, images, count_mode="standard"):
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             session = db.execute("SELECT status FROM sessions WHERE id=?", (session_id,)).fetchone()
@@ -97,13 +112,16 @@ class Store:
                 AND i.sha256 IN ({placeholders}) LIMIT 1""", (session_id, *hashes)).fetchone()
             if duplicate:
                 return "duplicate"
-            db.execute("INSERT INTO batches VALUES (?,?,?,?,?)",
-                       (batch_id, session_id, "queued", now(), None))
+            db.execute("""INSERT INTO batches (id, session_id, status, created_at, error, count_mode)
+                VALUES (?,?,?,?,?,?)""", (batch_id, session_id, "queued", now(), None, count_mode))
             db.executemany("""INSERT INTO images (id, batch_id, ordinal, filename,
                 original_filename, sha256, count, detections, annotated_filename,
-                width, height, elapsed_ms, warning) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""", [
+                width, height, elapsed_ms, warning, reference_boxes, search_areas)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", [
                 (item["id"], batch_id, i, item["filename"], item["original_filename"],
-                 item["sha256"], None, None, None, item["width"], item["height"], None, None)
+                 item["sha256"], None, None, None, item["width"], item["height"], None, None,
+                 json.dumps(item["reference_boxes"]) if "reference_boxes" in item else None,
+                 json.dumps(item["search_areas"]) if "search_areas" in item else None)
                 for i, item in enumerate(images)
             ])
         return None
@@ -117,18 +135,19 @@ class Store:
             db.execute("BEGIN IMMEDIATE")
             for result in results:
                 db.execute("""UPDATE images SET count=?, detections=?, annotated_filename=?,
-                    width=?, height=?, elapsed_ms=?, warning=?, processing=? WHERE id=? AND batch_id=?""",
+                    width=?, height=?, elapsed_ms=?, warning=?, processing=?, verification=? WHERE id=? AND batch_id=?""",
                     (result["count"], json.dumps(result["detections"]),
                      result["annotated_filename"], result["width"], result["height"],
                      result["elapsed_ms"], result.get("warning"),
                      json.dumps(result["processing"]) if result.get("processing") is not None else None,
+                     json.dumps(result["verification"]) if result.get("verification") is not None else None,
                      result["id"], batch_id))
             db.execute("UPDATE batches SET status='complete', error=NULL WHERE id=?", (batch_id,))
 
     def finish(self, session_id):
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            session = db.execute("SELECT status FROM sessions WHERE id=?", (session_id,)).fetchone()
+            session = db.execute("SELECT status, model FROM sessions WHERE id=?", (session_id,)).fetchone()
             if not session:
                 return "missing"
             if session["status"] == "finished":
@@ -136,7 +155,39 @@ class Store:
             if db.execute("SELECT 1 FROM batches WHERE session_id=? AND status IN ('queued','running')",
                           (session_id,)).fetchone():
                 return "busy"
+            if session["model"] == CROSSCHECK_MODEL_ID and db.execute("""SELECT 1 FROM images i
+                    JOIN batches b ON b.id=i.batch_id WHERE b.session_id=? AND b.status='complete'
+                    AND i.reviewed_at IS NULL LIMIT 1""", (session_id,)).fetchone():
+                return "unreviewed"
             db.execute("UPDATE sessions SET status='finished' WHERE id=?", (session_id,))
+        return None
+
+    def review_image_row(self, session_id, image_id):
+        with self.connection() as db:
+            return db.execute("""SELECT i.*, b.status AS batch_status FROM images i
+                JOIN batches b ON b.id=i.batch_id WHERE b.session_id=? AND i.id=?""",
+                (session_id, image_id)).fetchone()
+
+    def save_review(self, session_id, image_id, revision, detections, annotated_filename, reviewed):
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("""SELECT i.review_revision, b.status AS batch_status,
+                s.status AS session_status FROM images i JOIN batches b ON b.id=i.batch_id
+                JOIN sessions s ON s.id=b.session_id WHERE s.id=? AND i.id=?""",
+                (session_id, image_id)).fetchone()
+            if row is None:
+                return "missing"
+            if row["session_status"] != "active":
+                return "finished"
+            if row["batch_status"] != "complete" or db.execute(
+                    "SELECT 1 FROM batches WHERE session_id=? AND status IN ('queued','running')",
+                    (session_id,)).fetchone():
+                return "busy"
+            if row["review_revision"] != revision:
+                return "stale"
+            db.execute("""UPDATE images SET review_detections=?, review_annotated_filename=?,
+                review_revision=review_revision+1, reviewed_at=? WHERE id=?""",
+                (json.dumps(detections), annotated_filename, now() if reviewed else None, image_id))
         return None
 
     def detail(self, session_id):
@@ -148,7 +199,7 @@ class Store:
             batches = db.execute("SELECT * FROM batches WHERE session_id=? ORDER BY rowid",
                                  (session_id,)).fetchall()
             batch_data = []
-            total_count = image_count = 0
+            total_count = image_count = reviewed_count = 0
             for batch in batches:
                 result_data = []
                 batch_count = 0
@@ -156,21 +207,36 @@ class Store:
                     images = db.execute("SELECT * FROM images WHERE batch_id=? ORDER BY ordinal",
                                         (batch["id"],)).fetchall()
                     for item in images:
-                        count = item["count"]
+                        reviewed_detections = (json.loads(item["review_detections"])
+                                               if item["review_detections"] is not None else None)
+                        count = len(reviewed_detections) if reviewed_detections is not None else item["count"]
                         batch_count += count
+                        reviewed_count += item["reviewed_at"] is not None
                         result_data.append({
                             "id": item["id"], "filename": item["filename"], "count": count,
-                            "annotated_url": self.file_url(session_id, item["annotated_filename"]),
+                            "annotated_url": self.file_url(session_id, item["review_annotated_filename"]
+                                                           or item["annotated_filename"]),
                             "original_url": self.file_url(session_id, item["original_filename"]),
-                            "detections": json.loads(item["detections"]),
+                            "detections": (reviewed_detections if reviewed_detections is not None
+                                           else json.loads(item["detections"])),
+                            "model_count": item["count"], "model_detections": json.loads(item["detections"]),
+                            "model_annotated_url": self.file_url(session_id, item["annotated_filename"]),
+                            "reviewed": item["reviewed_at"] is not None, "reviewed_at": item["reviewed_at"],
+                            "review_revision": item["review_revision"],
+                            "verification": json.loads(item["verification"]) if item["verification"] else None,
                             "width": item["width"], "height": item["height"],
                             "elapsed_ms": item["elapsed_ms"], "warning": item["warning"],
                             "processing": json.loads(item["processing"]) if item["processing"] else None,
+                            "reference_boxes": (json.loads(item["reference_boxes"])
+                                                if item["reference_boxes"] else []),
+                            "search_areas": (json.loads(item["search_areas"])
+                                             if item["search_areas"] else []),
                         })
                     total_count += batch_count
                     image_count += len(images)
                 batch_data.append({
                     "id": batch["id"], "status": batch["status"],
+                    "count_mode": batch["count_mode"],
                     "created_at": batch["created_at"], "error": batch["error"],
                     "total_count": batch_count, "results": result_data,
                 })
@@ -179,6 +245,8 @@ class Store:
             "confidence": session["confidence"], "status": session["status"],
             "created_at": session["created_at"], "total_count": total_count,
             "image_count": image_count,
+            "reviewed_image_count": reviewed_count, "unreviewed_image_count": image_count - reviewed_count,
+            "requires_review": session["model"] == CROSSCHECK_MODEL_ID,
             "references": [{
                 "filename": ref["filename"], "url": self.file_url(session_id, ref["filename"]),
                 "boxes": json.loads(ref["boxes"]), "width": ref["width"], "height": ref["height"],
@@ -195,5 +263,5 @@ class Store:
             return bool(db.execute("SELECT 1 FROM refs WHERE session_id=? AND filename=?", (session_id, filename)).fetchone()
                 or db.execute("""SELECT 1 FROM images i JOIN batches b ON b.id=i.batch_id
                     WHERE b.session_id=? AND (b.status IN ('queued','running','complete') AND i.original_filename=? OR
-                    (b.status='complete' AND i.annotated_filename=?))""",
-                    (session_id, filename, filename)).fetchone())
+                    (b.status='complete' AND (i.annotated_filename=? OR i.review_annotated_filename=?)))""",
+                    (session_id, filename, filename, filename)).fetchone())

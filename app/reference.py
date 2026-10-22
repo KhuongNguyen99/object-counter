@@ -1,4 +1,4 @@
-"""Text-guided, editable reference boxes from the bundled CountGD++ detector."""
+"""Editable reference-box candidates from prompt-free FastSAM segmentation."""
 
 import math
 import time
@@ -36,36 +36,46 @@ def _select_boxes(boxes, qualities, width, height):
     return sorted(kept, key=lambda item: (-item[1], item[0]))
 
 
-def propose_boxes(model, image_path, label):
+def propose_boxes(model, image_path, device):
     from .inference import _read_image
 
     started = time.perf_counter()
     image = _read_image(image_path)
     width, height = image.size
-    predictions, qualities = model._predict(image, image, [], .23, label)
-    xyxy = []
-    for box, quality in zip(predictions, qualities, strict=True):
-        if len(box) != 4:
-            raise ValueError("The reference detector returned an invalid box")
-        cx, cy, bw, bh = map(float, box)
-        if (not all(math.isfinite(value) for value in (cx, cy, bw, bh, quality))
-                or not 0 <= cx <= 1 or not 0 <= cy <= 1 or bw <= 0 or bh <= 0
-                or not 0 <= quality <= 1):
-            raise ValueError("The reference detector returned an invalid box")
-        xyxy.append([max(0, (cx - bw / 2) * width), max(0, (cy - bh / 2) * height),
-                     min(width, (cx + bw / 2) * width), min(height, (cy + bh / 2) * height)])
-    candidates = _select_boxes(xyxy, qualities, width, height)
+    results = model.predict(image, device=device, imgsz=1024, conf=.25, iou=.9,
+                            retina_masks=False, verbose=False, save=False)
+    try:
+        if len(results) != 1:
+            raise ValueError
+        xyxy = results[0].boxes.xyxy.tolist()
+        qualities = results[0].boxes.conf.tolist()
+        if len(xyxy) != len(qualities):
+            raise ValueError
+        checked_boxes, checked_qualities = [], []
+        for box, quality in zip(xyxy, qualities, strict=True):
+            if len(box) != 4:
+                raise ValueError
+            box = list(map(float, box))
+            quality = float(quality)
+            if (not all(math.isfinite(value) for value in (*box, quality))
+                    or not 0 <= box[0] < box[2] <= width
+                    or not 0 <= box[1] < box[3] <= height
+                    or not 0 <= quality <= 1):
+                raise ValueError
+            checked_boxes.append(box)
+            checked_qualities.append(quality)
+    except (AttributeError, IndexError, TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("FastSAM returned an invalid box") from exc
+    candidates = _select_boxes(checked_boxes, checked_qualities, width, height)
     boxes = []
-    for box, _quality in candidates[:32]:
+    for box, _quality in candidates:
         margin = max(2, .02 * max(box[2] - box[0], box[3] - box[1]))
         boxes.append([max(0, math.floor(box[0] - margin)), max(0, math.floor(box[1] - margin)),
                       min(width, math.ceil(box[2] + margin)), min(height, math.ceil(box[3] + margin))])
     boxes.sort(key=lambda box: (box[1], box[0]))
     warning = None
     if not boxes:
-        warning = "No matching object found. Refine the description or draw a box manually."
-    elif len(candidates) > 32:
-        warning = "Showing the 32 strongest boxes. Remove unwanted examples."
-    return {"model": "countgd-plusplus", "width": width, "height": height,
+        warning = "No object candidates found. Draw a box manually."
+    return {"model": "fastsam-s", "width": width, "height": height,
             "boxes": boxes, "warning": warning,
             "elapsed_ms": round((time.perf_counter() - started) * 1000, 2)}
