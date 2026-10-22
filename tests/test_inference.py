@@ -66,7 +66,8 @@ def test_model_catalog_only_offers_countgd_and_requires_local_checkpoints(tmp_pa
     assert countgd["id"] == "countgd-plusplus"
     assert countgd["default_confidence"] == .80
     assert countgd["reference_mode"] == "per_image"
-    assert countgd["required_reference_boxes"] == 10
+    assert countgd["required_reference_boxes"] is None
+    assert countgd["recommended_reference_boxes"] == 10
     assert not countgd["available"]
     with pytest.raises(ValueError):
         checkpoint_path("../../untrusted")
@@ -82,8 +83,12 @@ def test_countgd_per_image_runs_one_conditioning_call_per_target(tmp_path, monke
     first = _fixture_image(tmp_path / "first.png", (16, 12))
     second = _fixture_image(tmp_path / "second.png", (16, 12))
     third = _fixture_image(tmp_path / "third.png", (16, 12))
-    references = [{"path": first, "boxes": [[i, 1, i + 4, 5] for i in range(1, 11)]},
-                  {"path": second, "boxes": [[i, 2, i + 4, 6] for i in range(1, 11)]}]
+    fourth = _fixture_image(tmp_path / "fourth.png", (16, 12))
+    def boxes_for(count, row):
+        return [[1 + i / 100, row, 5 + i / 100, row + 4] for i in range(count)]
+
+    references = [{"path": first, "boxes": boxes_for(1, 1)},
+                  {"path": second, "boxes": boxes_for(9, 2)}]
 
     class FakeCountGD:
         def __init__(self):
@@ -106,23 +111,28 @@ def test_countgd_per_image_runs_one_conditioning_call_per_target(tmp_path, monke
     assert [refs[0]["boxes"] for refs, *_ in model.calls] == [ref["boxes"] for ref in references]
     assert all(len(refs) == 1 for refs, *_ in model.calls)
 
-    later = {"path": third, "boxes": [[i, 3, i + 4, 7] for i in range(1, 11)]}
-    engine.count("countgd-plusplus", [later], [third], str(tmp_path / "out"),
+    later = [{"path": third, "boxes": boxes_for(11, 3)},
+             {"path": fourth, "boxes": boxes_for(32, 4)}]
+    engine.count("countgd-plusplus", later, [third, fourth], str(tmp_path / "out"),
                  reference_mode="per_image")
-    assert model.calls[-1][0] == [later] and model.calls[-1][1] == [third]
+    assert [(refs, paths) for refs, paths, *_ in model.calls[2:]] == [
+        ([later[0]], [third]), ([later[1]], [fourth])]
 
 
 @pytest.mark.parametrize("bad_references", [
-    lambda first, second: [{"path": first, "boxes": [[1, 1, 8, 8]] * 9}],
-    lambda first, second: [{"path": first, "boxes": [[1, 1, 8, 8]] * 11}],
-    lambda first, second: [{"path": first, "boxes": [[1, 1, 8, 8]] * 10}],
+    lambda first, second: [{"path": first, "boxes": []}],
+    lambda first, second: [{"path": first, "boxes": [[1 + i / 100, 1, 5 + i / 100, 5]
+                                                   for i in range(33)]}],
+    lambda first, second: [{"path": first, "boxes": [[1, 1, 8, 8]] * 2}],
     lambda first, second: [{"path": first, "boxes": [[True, 1, 8, 8]] +
                            [[i, 1, i + 4, 5] for i in range(2, 11)]}],
     lambda first, second: [{"path": first, "boxes": [["1", 1, 8, 8]] +
                            [[i, 1, i + 4, 5] for i in range(2, 11)]}],
-    lambda first, second: [{"path": second, "boxes": [[1, 1, 8, 8]] * 10}],
-    lambda first, second: [{"path": first, "boxes": [[1, 1, 8, 8]] * 10},
-                           {"path": second, "boxes": [[1, 1, 8, 8]] * 10}],
+    lambda first, second: [{"path": first, "boxes": [[1, 1, float("nan"), 8]]}],
+    lambda first, second: [{"path": first, "boxes": [[1, 1, 17, 8]]}],
+    lambda first, second: [{"path": second, "boxes": [[1, 1, 8, 8]]}],
+    lambda first, second: [{"path": first, "boxes": [[1, 1, 8, 8]]},
+                           {"path": second, "boxes": [[1, 1, 8, 8]]}],
 ])
 def test_countgd_per_image_rejects_invalid_references_before_model_load(tmp_path, monkeypatch,
                                                                          bad_references):

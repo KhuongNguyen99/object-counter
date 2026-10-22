@@ -73,6 +73,7 @@ globalThis.ReferenceBoxEditor = class ReferenceBoxEditor {
 
   limit(ref = this.ref) { return this.options.getLimit?.(ref) ?? 32; }
   required(ref = this.ref) { return this.options.getRequired?.(ref) ?? null; }
+  recommended(ref = this.ref) { return this.options.getRecommended?.(ref) ?? null; }
   total(ref = this.ref) { return this.options.getTotal?.(ref) ?? ref?.boxes.length ?? 0; }
   limitMessage() { return this.options.limitMessage?.() || `Use at most ${this.limit()} example boxes.`; }
   data(ref) { if (!this.drafts.has(ref)) this.reset(ref); return this.drafts.get(ref); }
@@ -296,7 +297,12 @@ globalThis.ReferenceBoxEditor = class ReferenceBoxEditor {
 
   valid() {
     const boxes = this.ref?.boxes || [], required = this.required();
-    return required == null ? !!boxes.length : this.total() === required && new Set(boxes.map((box) => JSON.stringify(box))).size === required;
+    if (!Array.isArray(boxes) || !boxes.length || this.total() > this.limit() ||
+        new Set(boxes.map((box) => JSON.stringify(box))).size !== boxes.length ||
+        !boxes.every((box) => Array.isArray(box) && box.length === 4 && box.every(Number.isFinite) &&
+          0 <= box[0] && box[0] < box[2] && box[2] <= this.ref.width &&
+          0 <= box[1] && box[1] < box[3] && box[3] <= this.ref.height)) return false;
+    return required == null || this.total() === required;
   }
   focus() {
     if (this.options.isBusy()) return;
@@ -466,7 +472,10 @@ globalThis.ReferenceBoxEditor = class ReferenceBoxEditor {
     this.$("auto-detect-boxes").disabled = busy || editing || !data.areas.length;
     this.$("auto-detect-boxes").setAttribute("aria-busy", String(this.options.isDetecting(ref)));
     this.$("drawing-surface").classList.toggle("detecting", this.options.isDetecting(ref));
-    this.$("reference-selected-count").textContent = `${total} / ${this.required(ref) ?? limit} selected`;
+    const recommended = this.recommended(ref), required = this.required(ref);
+    this.$("reference-selected-count").textContent = required == null
+      ? `${total} selected${recommended ? ` · ${recommended} recommended` : ""}`
+      : `${total} / ${required} selected`;
     this.layoutImage();
     this.renderCrop();
     if (restoreThumbnail && !busy) {

@@ -1,4 +1,4 @@
-/* Real FastSAM + CountGD++ per-photo exact-ten workflow, including a later batch. */
+/* Real FastSAM + CountGD++ flexible per-photo examples, including a later batch. */
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -32,14 +32,26 @@ async function upload(page, input, files) {
   const before = report.proposals.length;
   await page.locator(input).setInputFiles(files);
   await page.waitForFunction(count => document.querySelectorAll('#reference-thumbs button').length === count &&
-    document.querySelector('#auto-detect-boxes').getAttribute('aria-busy') !== 'true' &&
     !document.querySelector('#next-gallery').disabled, files.length, { timeout: 180000 });
-  const deadline = Date.now() + 180000;
-  while (report.proposals.length < before + files.length && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25));
-  assert.equal(report.proposals.length, before + files.length);
   const chosen = [];
   for (let photo = 0; photo < files.length; photo++) {
     await page.locator('#reference-thumbs button').nth(photo).click();
+    await page.waitForFunction(() => document.querySelector('#editor-image').complete && document.querySelector('#editor-image').naturalWidth > 0);
+    if (await page.locator('#reference-select-areas').getAttribute('aria-pressed') !== 'true') await page.locator('#reference-select-areas').click();
+    await page.locator('#box-overlay').scrollIntoViewIfNeeded();
+    const bounds = await page.locator('#box-overlay').boundingBox();
+    await page.mouse.move(bounds.x + bounds.width * .01, bounds.y + bounds.height * .01);
+    await page.mouse.down();
+    await page.mouse.move(bounds.x + bounds.width * .99, bounds.y + bounds.height * .99, { steps: 12 });
+    await page.mouse.up();
+    const proposalResponse = page.waitForResponse(response => response.url().endsWith('/api/reference-boxes') &&
+      response.request().method() === 'POST', { timeout: 240000 });
+    await page.locator('#auto-detect-boxes').click();
+    assert.equal((await proposalResponse).status(), 200);
+    await page.waitForFunction(() => document.querySelector('#auto-detect-boxes').getAttribute('aria-busy') !== 'true');
+    if (await page.locator('#reference-select-areas').getAttribute('aria-pressed') === 'true') await page.locator('#reference-select-areas').click();
+    const deadline = Date.now() + 10000;
+    while (report.proposals.length < before + photo + 1 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25));
     const boxes = await selectedBoxes(page);
     const proposal = report.proposals[before + photo];
     const filtered = algorithm.ReferenceSelection.prepare(proposal.boxes, proposal.width, proposal.height, () => .5);
@@ -89,9 +101,7 @@ async function upload(page, input, files) {
     await page.keyboard.press('x');
     assert.equal(await page.locator('.reference-box-marker').count(), 9);
     assert.equal(await page.locator('#reference-crop').getAttribute('data-box'), cropBefore, 'X deselects without skipping');
-    assert.equal(await page.locator('#reference-done').isDisabled(), true);
-    await page.keyboard.press('Space');
-    assert.equal(await page.locator('.reference-box-marker').count(), 10);
+    assert.equal(await page.locator('#reference-done').isDisabled(), false);
     firstBoxes[1] = await selectedBoxes(page);
     await page.screenshot({ path: path.join(output, 'references-desktop.png'), fullPage: true });
     await page.locator('#reference-image-viewport').scrollIntoViewIfNeeded();
@@ -115,7 +125,8 @@ async function upload(page, input, files) {
     report.sessionId = initial.id;
     assert.equal(initial.model, 'countgd-plusplus');
     assert.equal(initial.reference_mode, 'per_image');
-    assert.equal(initial.required_reference_boxes, 10);
+    assert.equal(initial.required_reference_boxes, null);
+    assert.equal(initial.recommended_reference_boxes, 10);
     assert.equal(initial.label, '');
     assert.equal(initial.confidence, .23);
     assert.deepEqual(initial.references, []);
@@ -130,6 +141,11 @@ async function upload(page, input, files) {
     await page.reload();
     await page.waitForFunction(() => !document.querySelector('#session-view').hidden && !document.querySelector('#next-gallery').disabled);
     const laterBoxes = await upload(page, '#next-gallery', [nextInput]);
+    await page.locator('.reference-proposal-marker').first().click();
+    await page.keyboard.press('Space');
+    assert.equal(await page.locator('.reference-box-marker').count(), 11);
+    assert.equal(await page.locator('#reference-done').isDisabled(), false);
+    laterBoxes[0] = await selectedBoxes(page);
     await page.locator('#upload-button').click();
     const final = await settled(context, initial.id, 2);
     assert.deepEqual(final.batches[1].results[0].reference_boxes, laterBoxes[0]);

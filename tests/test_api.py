@@ -34,7 +34,8 @@ def test_production_catalog_only_exposes_countgd_even_with_other_models(tmp_path
         {"id": "sam3", "available": True},
         {"id": "yoloe-26s-seg", "available": True},
         {"id": "countgd-plusplus", "available": countgd_available,
-         "reference_mode": "per_image", "required_reference_boxes": 10,
+         "reference_mode": "per_image", "required_reference_boxes": None,
+         "recommended_reference_boxes": 10,
          "default_confidence": .80},
     ])
     monkeypatch.setattr(main_module, "_device", lambda _: "cpu")
@@ -43,6 +44,8 @@ def test_production_catalog_only_exposes_countgd_even_with_other_models(tmp_path
         assert catalog["default_model"] == "countgd-plusplus"
         assert [model["id"] for model in catalog["models"]] == ["countgd-plusplus"]
         assert catalog["models"][0]["available"] == countgd_available
+        assert catalog["models"][0]["required_reference_boxes"] is None
+        assert catalog["models"][0]["recommended_reference_boxes"] == 10
         rejected = client.post("/api/sessions", data={"model": "sam3"})
         assert rejected.status_code == 422
         assert rejected.json()["detail"] == "Counting is unavailable right now. Please try again."
@@ -52,7 +55,8 @@ def test_production_catalog_only_exposes_countgd_even_with_other_models(tmp_path
             assert created.json()["confidence"] == .80
             monkeypatch.setattr(model_module, "list_models", lambda: [
                 {"id": "countgd-plusplus", "available": False,
-                 "reference_mode": "per_image", "required_reference_boxes": 10},
+                 "reference_mode": "per_image", "required_reference_boxes": None,
+                 "recommended_reference_boxes": 10},
             ])
             blocked = new_batch(client, created.json()["id"], ("target.png", png("blue")))
             assert blocked.status_code == 422
@@ -278,19 +282,22 @@ def test_sam3_uses_each_target_as_its_own_reference_and_persists_boxes(tmp_path)
                 for batch in restored["batches"]] == [boxes, later_boxes]
 
 
-def test_countgd_uses_ten_boxes_from_each_photo_across_batches(tmp_path):
+def test_countgd_accepts_flexible_boxes_from_each_photo_across_batches(tmp_path):
     engine = FakeEngine()
     models = [{"id": "countgd-plusplus", "available": True, "reference_mode": "per_image",
-               "required_reference_boxes": 10}]
-    boxes = [[[i, 1, i + 4, 5] for i in range(1, 11)],
-             [[i, 2, i + 4, 6] for i in range(1, 11)]]
+               "required_reference_boxes": None, "recommended_reference_boxes": 10}]
+    def boxes_for(count, row):
+        return [[1 + i / 100, row, 5 + i / 100, row + 4] for i in range(count)]
+
+    boxes = [boxes_for(1, 1), boxes_for(9, 2)]
     with TestClient(create_app(tmp_path, lambda: engine, lambda: models)) as client:
         created = client.post("/api/sessions", data={"model": "countgd-plusplus", "label": ""})
         assert created.status_code == 201, created.text
         session_id = created.json()["id"]
         assert created.json()["references"] == []
         assert created.json()["reference_mode"] == "per_image"
-        assert created.json()["required_reference_boxes"] == 10
+        assert created.json()["required_reference_boxes"] is None
+        assert created.json()["recommended_reference_boxes"] == 10
         assert client.post("/api/sessions", data={"model": "countgd-plusplus"},
                            files=[("references", upload("ref.png", png("red")))]).status_code == 422
         first = client.post(f"/api/sessions/{session_id}/batches",
@@ -306,40 +313,44 @@ def test_countgd_uses_ten_boxes_from_each_photo_across_batches(tmp_path):
         assert [ref["boxes"] for ref in engine.calls[0][1]] == boxes
         assert [result["reference_boxes"] for result in batch["results"]] == boxes
 
-        later_boxes = [[[i, 3, i + 4, 7] for i in range(1, 11)]]
+        later_boxes = [boxes_for(11, 3), boxes_for(32, 4)]
         later = client.post(f"/api/sessions/{session_id}/batches",
                             data={"image_boxes": json.dumps(later_boxes)},
-                            files=[("images", upload("yellow.png", png("yellow")))])
+                            files=[("images", upload("yellow.png", png("yellow"))),
+                                   ("images", upload("purple.png", png("purple")))])
         assert later.status_code == 202, later.text
         assert settled(client, session_id, later.json()["id"])[1]["status"] == "complete"
-        assert len(engine.calls[1][1]) == 1
-        assert engine.calls[1][1][0]["path"] == engine.calls[1][2][0]
-        assert engine.calls[1][1][0]["boxes"] == later_boxes[0]
+        assert [ref["path"] for ref in engine.calls[1][1]] == engine.calls[1][2]
+        assert [ref["boxes"] for ref in engine.calls[1][1]] == later_boxes
 
     with TestClient(create_app(tmp_path, FakeEngine, lambda: models)) as client:
         restored = client.get(f"/api/sessions/{session_id}").json()
         assert restored["reference_mode"] == "per_image"
-        assert restored["required_reference_boxes"] == 10
+        assert restored["required_reference_boxes"] is None
+        assert restored["recommended_reference_boxes"] == 10
         assert [[result["reference_boxes"] for result in batch["results"]]
                 for batch in restored["batches"]] == [boxes, later_boxes]
 
 
-@pytest.mark.parametrize("boxes", [
-    [[i, 1, i + 4, 5] for i in range(1, 10)],
-    [[i, 1, i + 4, 5] for i in range(1, 12)],
-    [[1, 1, 8, 8]] * 10,
+@pytest.mark.parametrize("boxes,detail", [
+    ([], "1–32 boxes"),
+    ([[1, 1, 8, 8]] * 2, "distinct boxes"),
+    ([[1, 1, 8]], "four finite pixel coordinates"),
+    ([[1, 1, float("nan"), 8]], "four finite pixel coordinates"),
+    ([[1, 1, 17, 8]], "fit inside their image"),
+    ([[1 + i / 100, 1, 5 + i / 100, 5] for i in range(33)], "1–32 boxes"),
 ])
-def test_countgd_rejects_wrong_or_duplicate_boxes_before_queue(tmp_path, boxes):
+def test_countgd_rejects_invalid_boxes_before_queue(tmp_path, boxes, detail):
     engine = FakeEngine()
     models = [{"id": "countgd-plusplus", "available": True, "reference_mode": "per_image",
-               "required_reference_boxes": 10}]
+               "required_reference_boxes": None, "recommended_reference_boxes": 10}]
     with TestClient(create_app(tmp_path, lambda: engine, lambda: models)) as client:
         session_id = client.post("/api/sessions", data={"model": "countgd-plusplus"}).json()["id"]
         rejected = client.post(f"/api/sessions/{session_id}/batches",
                                data={"image_boxes": json.dumps([boxes])},
                                files=[("images", upload("target.png", png("blue")))])
         assert rejected.status_code == 422
-        assert "exactly 10 distinct" in rejected.json()["detail"]
+        assert detail in rejected.json()["detail"]
         assert engine.calls == []
         assert client.get(f"/api/sessions/{session_id}").json()["batches"] == []
         assert list((tmp_path / session_id / "files").iterdir()) == []
@@ -348,7 +359,7 @@ def test_countgd_rejects_wrong_or_duplicate_boxes_before_queue(tmp_path, boxes):
 def test_legacy_countgd_session_keeps_shared_reference_batches(tmp_path):
     engine = FakeEngine()
     models = [{"id": "countgd-plusplus", "available": True, "reference_mode": "per_image",
-               "required_reference_boxes": 10}]
+               "required_reference_boxes": None, "recommended_reference_boxes": 10}]
     app = create_app(tmp_path, lambda: engine, lambda: models)
     session_id = "legacy-countgd-session"
     files_dir = tmp_path / session_id / "files"

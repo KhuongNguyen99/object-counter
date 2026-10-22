@@ -503,15 +503,15 @@ const visualCatalog = { models: [
   { id: "sam3", name: "SAM3", available: true, reference_mode: "per_image" },
 ], default_model: "sam3" };
 const countgdCatalog = { models: [{ id: "countgd-plusplus", name: "CountGD++", available: true,
-  reference_mode: "per_image", required_reference_boxes: 10 }], default_model: "countgd-plusplus" };
+  reference_mode: "per_image", required_reference_boxes: null, recommended_reference_boxes: 10 }], default_model: "countgd-plusplus" };
 const countgdProposals = (shift = 0) => Array.from({ length: 16 }, (_, index) => {
   const x = 5 + index % 4 * 20 + shift, y = 5 + Math.floor(index / 4) * 15;
   return [x, y, x + 8, y + 8];
 });
 
-test("CountGD filters proposal sizes, preselects ten per photo, and rejects a nine-box submission", async () => {
+test("CountGD filters proposals, preselects ten per photo, and submits nine initial and eleven later boxes", async () => {
   const first = countgdProposals(), second = countgdProposals(1);
-  const visualSession = { ...session(), model: "countgd-plusplus", label: "", reference_mode: "per_image", required_reference_boxes: 10 };
+  const visualSession = { ...session(), model: "countgd-plusplus", label: "", reference_mode: "per_image", required_reference_boxes: null, recommended_reference_boxes: 10 };
   let detections = 0, sessionPost;
   const batches = [];
   const app = browser(async (path, options) => {
@@ -538,18 +538,25 @@ test("CountGD filters proposal sizes, preselects ten per photo, and rejects a ni
   const selected = editorItems(app).findIndex((item) => item.selected);
   app.referenceReview.deselect(selected);
   assert.equal(app.state.targets[0].boxes.length, 9);
-  assert.equal(app.get("reference-done").disabled, true);
-  await app.get("start-button").listeners.click();
-  assert.equal(sessionPost, undefined);
-  assert.match(app.get("notice").textContent, /exactly 10.*9\/10/);
-  app.get("reference-box-toggle").listeners.click();
-  app.get("reference-box-toggle").listeners.click();
-  assert.equal(app.state.targets[0].boxes.length, 10, "an eleventh box cannot be selected");
+  assert.equal(app.get("reference-done").disabled, false);
+  assert.equal(app.get("reference-selected-count").textContent, "9 selected · 10 recommended");
   const expected = JSON.stringify(app.state.targets.map((item) => item.boxes));
   await app.get("start-button").listeners.click();
   assert.equal(sessionPost.find(([key]) => key === "reference_boxes")[1], "[]");
   assert.equal(sessionPost.some(([key]) => key === "references"), false);
   assert.equal(batches[0].find(([key]) => key === "image_boxes")[1], expected);
+  await app.addTargets([referenceFile("later.png")]);
+  await detectPhoto(app, app.state.targets[0]);
+  const later = app.state.targets[0];
+  assert.equal(later.boxes.length, 10);
+  const candidate = editorItems(app).findIndex((item) => !item.selected);
+  activateBox(app, candidate);
+  toggleBox(app);
+  assert.equal(later.boxes.length, 11);
+  assert.equal(app.get("reference-done").disabled, false);
+  const laterExpected = JSON.stringify([later.boxes]);
+  await app.uploadBatch();
+  assert.equal(batches[1].find(([key]) => key === "image_boxes")[1], laterExpected);
 });
 
 test("CountGD never restores size outliers to reach ten and accepts manually drawn replacements", async () => {
@@ -660,10 +667,10 @@ test("SAM3 mirrors prepared count photos, preserves shared references across mod
   assert.ok(!app.revoked.includes(shared.url));
 });
 
-test("switching SAM3 to CountGD preserves a selected size outlier and fills only open slots", async () => {
+test("switching SAM3 to CountGD preserves selected boxes and candidates without adding examples", async () => {
   const models = { models: [
     { id: "sam3", name: "SAM3", available: true, reference_mode: "per_image" },
-    { id: "countgd-plusplus", name: "CountGD++", available: true, reference_mode: "per_image", required_reference_boxes: 10 },
+    { id: "countgd-plusplus", name: "CountGD++", available: true, reference_mode: "per_image", required_reference_boxes: null, recommended_reference_boxes: 10 },
   ], default_model: "sam3" };
   let detections = 0;
   const app = browser(async (path) => { if (path === "/api/reference-boxes") detections++; return response(session()); }, null, models);
@@ -680,15 +687,16 @@ test("switching SAM3 to CountGD preserves a selected size outlier and fills only
   assert.equal(detections, 0, "neither photo upload nor model switch calls the detector");
   assert.equal(app.state.targets[0], photo);
   assert.deepEqual(Array.from(photo.boxes[0]), [0, 0, 100, 80], "the manually selected size outlier remains selected");
-  assert.equal(photo.boxes.length, 10, "nine valid candidates fill the remaining slots");
-  assert.equal(photo.candidates.length, 7);
+  assert.equal(photo.boxes.length, 1);
+  assert.equal(photo.candidates.length, 16);
+  assert.equal(app.get("reference-done").disabled, false);
   assert.deepEqual(Array.from(photo.detectionAreas[0]), [0, 0, 20, 20]);
 });
 
-test("switching SAM3 to CountGD keeps all over-limit manual selections and explains the correction", async () => {
+test("switching SAM3 to CountGD keeps eleven manual selections and allows Done", async () => {
   const models = { models: [
     { id: "sam3", name: "SAM3", available: true, reference_mode: "per_image" },
-    { id: "countgd-plusplus", name: "CountGD++", available: true, reference_mode: "per_image", required_reference_boxes: 10 },
+    { id: "countgd-plusplus", name: "CountGD++", available: true, reference_mode: "per_image", required_reference_boxes: null, recommended_reference_boxes: 10 },
   ], default_model: "sam3" };
   let detections = 0;
   const app = browser(async (path) => { if (path === "/api/reference-boxes") detections++; return response(session()); }, null, models);
@@ -704,8 +712,8 @@ test("switching SAM3 to CountGD keeps all over-limit manual selections and expla
   assert.equal(detections, 0);
   assert.deepEqual(Array.from(photo.boxes, (box) => Array.from(box)), selected,
     "the model change cannot silently discard a selected reference");
-  assert.match(app.get("notice").textContent, /Deselect 1 boxes to keep exactly 10/);
-  assert.equal(app.get("reference-done").disabled, true);
+  assert.equal(app.get("notice").textContent, "");
+  assert.equal(app.get("reference-done").disabled, false);
 });
 
 test("SAM3 submits only selected boxes in image order and keeps the editor usable for later batches", async () => {
@@ -1068,7 +1076,7 @@ test("proposals do not consume the 32-box limit until selected", async () => {
 });
 
 
-test("CountGD blocks duplicate per-photo references before creating a session", async () => {
+test("CountGD blocks duplicate and empty per-photo references before creating a session", async () => {
   let submitted = false;
   const app = browser(async () => { submitted = true; return response(session(), 201); }, null, countgdCatalog);
   await settle();
@@ -1078,7 +1086,11 @@ test("CountGD blocks duplicate per-photo references before creating a session", 
   await app.get("start-button").listeners.click();
   assert.equal(submitted, false);
   assert.equal(app.state.session, null);
-  assert.match(app.get("notice").textContent, /exactly 10.*1\/10/);
+  assert.match(app.get("notice").textContent, /1 to 32 distinct boxes/);
+  app.state.targets[0].boxes = [];
+  await app.get("start-button").listeners.click();
+  assert.equal(submitted, false);
+  assert.match(app.get("notice").textContent, /Draw a box on photo 1/);
 });
 
 test("an older counting engine remains viewable but offers a new count instead of more uploads", async () => {
@@ -1137,7 +1149,7 @@ test("Quick count sends marked areas in photo order without running suggestions 
   photos[0].detectionAreas = [[1, 2, 60, 70], [30, 5, 95, 75]];
   photos[1].detectionAreas = [[5, 3, 90, 65]];
   await app.get("start-button").listeners.click();
-  assert.deepEqual(calls, [], "standard count still requires ten examples");
+  assert.deepEqual(calls, [], "standard count still requires at least one example");
   await app.get("quick-count-button").listeners.click();
   assert.equal(calls.includes("/api/reference-boxes"), false);
   const entries = forms.find(([path]) => path.endsWith("/batches"))[1];
@@ -1188,7 +1200,7 @@ test("Quick result warnings stay visible without requiring examples or showing e
 });
 
 
-test("Find objects keeps more than 32 eligible suggestions while selecting only ten examples", async () => {
+test("Find objects preselects ten from more than 32 suggestions, then allows up to 32", async () => {
   const boxes = Array.from({ length: 40 }, (_, i) => {
     const x = 2 + i % 10 * 8, y = 2 + Math.floor(i / 10) * 8;
     return [x, y, x + 4, y + 4];
@@ -1206,5 +1218,13 @@ test("Find objects keeps more than 32 eligible suggestions while selecting only 
   assert.equal(photo.boxes.length, 10);
   assert.equal(photo.candidates.length, 30);
   assert.equal(new Set([...photo.boxes, ...photo.candidates].map(JSON.stringify)).size, 40);
-  assert.equal(app.get("reference-selected-count").textContent, "10 / 10 selected");
+  assert.equal(app.get("reference-selected-count").textContent, "10 selected · 10 recommended");
+  for (const index of editorItems(app).flatMap((item, index) => item.selected ? [] : [index]).slice(0, 22)) {
+    activateBox(app, index);
+    toggleBox(app);
+  }
+  assert.equal(photo.boxes.length, 32);
+  assert.equal(app.get("reference-done").disabled, false);
+  assert.equal(app.get("reference-box-toggle").disabled, true);
+  assert.equal(photo.candidates.length, 8, "remaining suggestions stay available but cannot exceed 32 selected boxes");
 });

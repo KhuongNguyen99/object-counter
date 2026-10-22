@@ -34,9 +34,10 @@
   const referenceMode = () => state.session?.reference_mode || modelMode(state.session?.model || $("model-select").value);
   const perImageMode = () => referenceMode() === "per_image";
   const activeRefs = () => perImageMode() ? state.targets : state.refs;
-  const requiredReferences = () => perImageMode() && (state.session?.model || $("model-select").value) === "countgd-plusplus" ? 10 : null;
-  const referenceLimit = () => requiredReferences() || 32;
-  const referenceLimitMessage = () => requiredReferences() ? "Choose exactly 10 examples in each photo." : perImageMode() ? "Use at most 32 boxes on each photo." : "Use at most 32 reference boxes in one count.";
+  const requiredReferences = () => null;
+  const recommendedReferences = () => perImageMode() && (state.session?.model || $("model-select").value) === "countgd-plusplus" ? 10 : null;
+  const referenceLimit = () => 32;
+  const referenceLimitMessage = () => perImageMode() ? "Use at most 32 boxes on each photo." : "Use at most 32 reference boxes in one count.";
 
   function message(text, success = false) {
     const box = $("notice");
@@ -56,6 +57,7 @@
     getTotal: (ref) => perImageMode() ? (ref?.boxes.length || 0) : state.refs.reduce((sum, item) => sum + item.boxes.length, 0),
     getLimit: referenceLimit,
     getRequired: requiredReferences,
+    getRecommended: recommendedReferences,
     limitMessage: referenceLimitMessage,
     isBusy: () => state.busy || state.restoring || !!state.session && (state.session.status === "finished" || !canContinueSession() || hasPending()),
     isDetecting: (ref) => state.detecting === ref,
@@ -240,19 +242,16 @@
       });
       if (!duplicate) { seen.push(box); candidates.push(box); }
     }
-    if (requiredReferences()) {
+    if (recommendedReferences()) {
       const prepared = ReferenceSelection.prepare(candidates, ref.width, ref.height);
-      const slots = Math.max(0, requiredReferences() - selected.length);
+      const slots = Math.max(0, recommendedReferences() - selected.length);
       ref.candidates = [...prepared.boxes.slice(slots), ...prepared.candidates];
       ref.boxes = [...selected, ...prepared.boxes.slice(0, slots)];
-      ref.referencePolicy = "ten";
     } else {
       ref.candidates = candidates;
     }
     referenceReview.reset(ref, true);
-    const warning = requiredReferences()
-      ? (ref.boxes.length < 10 ? `Choose ${10 - ref.boxes.length} more examples.` : "")
-      : warnings[0] || "";
+    const warning = warnings[0] || "";
     return { proposed: ref.candidates.length + ref.boxes.length, warning };
   }
 
@@ -284,17 +283,6 @@
           normalized.detectionAreas = item.detectionAreas || [];
           state.targets[index] = normalized;
           URL.revokeObjectURL(item.url);
-        }
-        const photo = state.targets[index];
-        if (requiredReferences() && photo.referencePolicy !== "ten" && (photo.boxes.length || photo.candidates.length)) {
-          const selected = photo.boxes.map((box) => [...box]);
-          const prepared = ReferenceSelection.prepare(photo.candidates, photo.width, photo.height);
-          const slots = Math.max(0, requiredReferences() - selected.length);
-          photo.boxes = [...selected, ...prepared.boxes.slice(0, slots)];
-          photo.candidates = [...prepared.boxes.slice(slots), ...prepared.candidates];
-          photo.referencePolicy = "ten";
-          referenceReview.reset(photo, true);
-          if (photo.boxes.length > requiredReferences()) issues.push(`${photo.file.name}: Deselect ${photo.boxes.length - requiredReferences()} boxes to keep exactly 10.`);
         }
       } catch (error) { issues.push(`${item.file.name}: ${error.message}`); }
     }
@@ -905,17 +893,19 @@
   }
 
   function ensurePerImageSelections() {
-    const required = requiredReferences();
-    const distinctCount = (item) => new Set((item.boxes || []).map((box) => JSON.stringify(box))).size;
-    const missing = state.targets.findIndex((item) => !item.normalizedForPrompts ||
-      (required ? item.boxes?.length !== required || distinctCount(item) !== required : !item.boxes?.length));
+    const validBoxes = (item) => Array.isArray(item.boxes) && item.boxes.every((box) => Array.isArray(box) && box.length === 4 &&
+      box.every(Number.isFinite) && 0 <= box[0] && box[0] < box[2] && box[2] <= item.width &&
+      0 <= box[1] && box[1] < box[3] && box[3] <= item.height);
+    const invalidBoxes = (item) => !validBoxes(item) || !item.boxes.length || item.boxes.length > referenceLimit() ||
+      new Set(item.boxes.map((box) => JSON.stringify(box))).size !== item.boxes.length;
+    const missing = state.targets.findIndex((item) => !item.normalizedForPrompts || invalidBoxes(item));
     if (missing < 0) return true;
     state.selected = missing;
     state.referenceEditing = true;
     renderReferences();
     message(!state.targets[missing].normalizedForPrompts
       ? `Photo ${missing + 1} could not be prepared. Remove it and try another file.`
-      : required ? `Choose exactly ${required} examples in photo ${missing + 1} (${distinctCount(state.targets[missing])}/${required}).`
+      : state.targets[missing].boxes?.length ? `Photo ${missing + 1} needs 1 to 32 distinct boxes inside the photo.`
       : state.targets[missing].candidates?.length
         ? `Select at least one box on photo ${missing + 1}.`
         : `Draw a box on photo ${missing + 1} before counting.`);

@@ -313,7 +313,9 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None, frontend_o
             raise HTTPException(404, "Session not found")
         if result["model"] == COUNTGD_MODEL_ID:
             result["reference_mode"] = "shared" if result["references"] else "per_image"
-            result["required_reference_boxes"] = 10 if not result["references"] else None
+            result["required_reference_boxes"] = None
+            if not result["references"]:
+                result["recommended_reference_boxes"] = 10
         else:
             entry = next((entry for entry in _model_catalog(model_lister, detect_device)["models"]
                           if entry["id"] == result["model"]), {})
@@ -564,11 +566,9 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None, frontend_o
             elif per_image:
                 groups = _parse_boxes(image_boxes, [(item["width"], item["height"]) for item in items],
                                       per_image=True)
-                if saved["required_reference_boxes"] is not None and any(
-                        len(group) != saved["required_reference_boxes"] or
-                        len({tuple(box) for box in group}) != saved["required_reference_boxes"]
-                        for group in groups):
-                    raise HTTPException(422, "Each CountGD++ target image needs exactly 10 distinct boxes")
+                if session["model"] == COUNTGD_MODEL_ID and any(
+                        len({tuple(box) for box in group}) != len(group) for group in groups):
+                    raise HTTPException(422, "Each CountGD++ target image needs distinct boxes")
                 for item, boxes in zip(items, groups):
                     item["reference_boxes"] = boxes
             if not slots.acquire(blocking=False):

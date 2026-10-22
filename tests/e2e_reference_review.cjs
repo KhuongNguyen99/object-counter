@@ -50,7 +50,7 @@ let session, submitted, detects = 0;
 let frontendOrigin;
 const uploads = [];
 const catalog = { default_model:'countgd-plusplus', models:[{id:'countgd-plusplus', name:'CountGD++',available:true,
-  reference_mode:'per_image',required_reference_boxes:10,default_confidence:.8}],device:'cuda' };
+  reference_mode:'per_image',required_reference_boxes:null,recommended_reference_boxes:10,default_confidence:.8}],device:'cuda' };
 const result = {id:'photo',filename:'parts.jpg',count:14,width:1000,height:800,reviewed:false,review_revision:0,
   elapsed_ms:1234,processing:{tiles:12,tile_size:800,duplicates_removed:10},warning:'Experimental CountGD++ model',
   detections:[{index:1,box:[200,200,260,260],confidence:.85}],original_url:'/photo.jpg',annotated_url:'/photo.jpg'};
@@ -72,7 +72,7 @@ const server = http.createServer(async(req,res)=>{
     if(url==='/api/reference-boxes') {await body(req); detects++;return json(res,fixture);}
     if(url==='/api/sessions' && req.method==='POST') {
       const data=await body(req);submitted={model:field(data,'model'),confidence:field(data,'confidence'),label:field(data,'label')};
-      session={id:'simple',label:'',model:submitted.model,reference_mode:'per_image',created_at:'2026-10-22T12:00:00Z',status:'active',total_count:0,image_count:0,references:[],batches:[]};
+      session={id:'simple',label:'',model:submitted.model,reference_mode:'per_image',required_reference_boxes:null,recommended_reference_boxes:10,created_at:'2026-10-22T12:00:00Z',status:'active',total_count:0,image_count:0,references:[],batches:[]};
       return json(res,session,201);
     }
     if(url==='/api/sessions/simple/batches') {
@@ -83,7 +83,7 @@ const server = http.createServer(async(req,res)=>{
       uploads.push(structuredClone(submitted));
       const counted=mode==='quick'?{...result,id:'quick-photo',count:3,warning:null,detections:[
         {index:1,box:[120,130,160,160],confidence:null},{index:2,box:[220,130,260,160],confidence:null},
-        {index:3,box:[320,130,360,160],confidence:null}]}:result;
+        {index:3,box:[320,130,360,160],confidence:null}]}:session.batches.length ? {...result,id:'later-photo'} : result;
       session.batches.push({id:'batch-'+session.batches.length,status:'complete',count_mode:mode,total_count:counted.count,results:[counted]});
       session.total_count=session.batches.reduce((total,batch)=>total+batch.total_count,0);session.image_count=session.batches.length;
       return json(res,{id:'batch',status:'complete'},202);
@@ -138,6 +138,9 @@ const frontendServer = separateOrigins ? http.createServer((req,res)=>{
     await page.locator('#editor-image').waitFor();
     await page.waitForFunction(()=>document.querySelector('#editor-image').complete && document.querySelector('#editor-image').naturalWidth>0);
     assert.equal(detects,0);
+    await page.locator('#start-button').click();
+    assert.match(await page.locator('#notice').innerText(),/Draw a box on photo 1/);
+    assert.equal(session,undefined,'zero selected examples cannot start a standard count');
     await page.locator('#reference-select-areas').click();
     await page.locator('#box-overlay').scrollIntoViewIfNeeded();
     let bounds=await page.locator('#box-overlay').boundingBox();
@@ -152,8 +155,13 @@ const frontendServer = separateOrigins ? http.createServer((req,res)=>{
     await page.locator('.reference-selected-thumbnail').first().click();
     await page.keyboard.press('x');
     assert.equal(await page.locator('.reference-selected-thumbnail').count(),9);
+    assert.equal(await page.locator('#reference-done').isDisabled(),false);
     await page.locator('#reference-image-viewport').focus();await page.keyboard.press('Space');
     assert.equal(await page.locator('.reference-selected-thumbnail').count(),10);
+    await page.locator('.reference-selected-thumbnail').first().click();
+    await page.keyboard.press('x');
+    assert.equal(await page.locator('.reference-selected-thumbnail').count(),9);
+    assert.equal(await page.locator('#reference-selected-count').innerText(),'9 selected · 10 recommended');
     assert.equal(await page.locator('.coordinate-entry').isVisible(),false);
     for(const width of [1440,390,320]) {
       await page.setViewportSize({width,height:1100});await page.locator('#reference-editor').scrollIntoViewIfNeeded();
@@ -180,7 +188,7 @@ const frontendServer = separateOrigins ? http.createServer((req,res)=>{
       await page.locator('#close-dialog').click();
     }
     assert.equal(submitted.model,'countgd-plusplus');assert.equal(submitted.confidence,'0.8');
-    assert.equal(submitted.boxes[0].length,10);assert.equal(submitted.label,'');
+    assert.equal(submitted.boxes[0].length,9);assert.equal(submitted.label,'');
     await noJargon();await page.screenshot({path:path.join(out,'results-desktop.png'),fullPage:true});
     await page.getByRole('button',{name:'Review photo',exact:true}).click();
     await page.locator('#review-image').waitFor();
@@ -191,6 +199,18 @@ const frontendServer = separateOrigins ? http.createServer((req,res)=>{
     await page.locator('#review-confirm').click();
     await page.locator('#review-dialog').waitFor({state:'hidden'});
     assert.equal(await page.locator('#review-dialog').isVisible(),false);
+    // A later standard batch may use a single manually drawn example.
+    await page.locator('#next-gallery').setInputFiles(photo);
+    await page.waitForFunction(()=>document.querySelector('#editor-image').complete && document.querySelector('#editor-image').naturalWidth>0);
+    await page.locator('#box-overlay').scrollIntoViewIfNeeded();
+    bounds=await page.locator('#box-overlay').boundingBox();
+    await page.mouse.move(bounds.x+bounds.width*.1,bounds.y+bounds.height*.1);await page.mouse.down();
+    await page.mouse.move(bounds.x+bounds.width*.2,bounds.y+bounds.height*.2,{steps:8});await page.mouse.up();
+    assert.equal(await page.locator('.reference-selected-thumbnail').count(),1);
+    assert.equal(await page.locator('#reference-done').isDisabled(),false);
+    await page.locator('#upload-button').click();
+    await page.waitForFunction(()=>document.querySelectorAll('#batch-list .batch-card').length===2);
+    assert.equal(uploads[1].boxes[0].length,1);
     // A later quick batch needs areas, but no selected examples or suggestion request.
     await page.locator('#next-gallery').setInputFiles(photo);
     await page.locator('#editor-image').waitFor();
@@ -211,14 +231,14 @@ const frontendServer = separateOrigins ? http.createServer((req,res)=>{
     }
     const before=detects;
     await page.locator('#quick-upload-button').click();
-    await page.waitForFunction(()=>document.querySelectorAll('#batch-list .batch-card').length===2);
+    await page.waitForFunction(()=>document.querySelectorAll('#batch-list .batch-card').length===3);
     assert.equal(detects,before,'quick counting is one batch request; no reference suggestions');
     assert.equal(uploads.at(-1).countMode,'quick');
     assert.deepEqual(uploads.at(-1).searchAreas,[marked]);
     assert.deepEqual(uploads.at(-1).boxes,[]);
     assert.match(await page.locator('#batch-list').innerText(),/Quick count/);
     await page.reload();
-    await page.waitForFunction(()=>document.querySelectorAll('#batch-list .batch-card').length===2);
+    await page.waitForFunction(()=>document.querySelectorAll('#batch-list .batch-card').length===3);
     if (separateOrigins) assert.equal(await page.locator('.result-image img').first().getAttribute('src'),backendOrigin + apiPrefix + '/photo.jpg');
     assert.match(await page.locator('#batch-list').innerText(),/Quick count/);
     await noJargon();
@@ -243,7 +263,7 @@ const frontendServer = separateOrigins ? http.createServer((req,res)=>{
     assert.equal(uploads.at(-1).boxes.length,0);
     assert.equal(uploads.at(-1).searchAreas.length,1);
     assert.deepEqual(errors,[]);
-    fs.writeFileSync(path.join(out,'report.json'),JSON.stringify({selected:10,detects,uploads,errors,widths:[1440,390,320]},null,2));
+    fs.writeFileSync(path.join(out,'report.json'),JSON.stringify({selected:9,detects,uploads,errors,widths:[1440,390,320]},null,2));
     console.log('PASS: standard and Quick count, required marked areas, no examples for Quick count, later batches, reload, desktop/mobile, review and shortcuts');
   }finally{await browser.close();if (frontendServer) await new Promise(resolve=>frontendServer.close(resolve));await new Promise(resolve=>server.close(resolve));
     const resolved=fs.realpathSync(temp);assert.equal(path.dirname(resolved),fs.realpathSync(os.tmpdir()));

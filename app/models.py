@@ -148,7 +148,8 @@ def list_models() -> list[dict]:
     return [{
         "id": COUNTGD_MODEL_ID, "name": "CountGD++",
         "family": "CountGD++", "size": "base", "default_confidence": 0.80,
-        "reference_mode": "per_image", "required_reference_boxes": 10,
+        "reference_mode": "per_image", "required_reference_boxes": None,
+        "recommended_reference_boxes": 10,
         "available": source_ready and all(path.is_file() and path.stat().st_size == expected_bytes
                          for path, (expected_bytes, _) in zip(paths, COUNTGD_ASSETS.values())),
         "bytes": sum(path.stat().st_size for path in paths if path.is_file()),

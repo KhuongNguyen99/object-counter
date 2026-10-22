@@ -179,18 +179,22 @@ class InferenceEngine:
                         not Path(reference["path"]).is_absolute() or
                         Path(reference["path"]).resolve() != Path(image_path).resolve()):
                     raise ValueError("Each CountGD++ reference path must match its target image.")
-                if not isinstance(reference.get("boxes"), list) or len(reference["boxes"]) != 10:
-                    raise ValueError("Each CountGD++ target image needs exactly 10 distinct boxes.")
+                if (not isinstance(reference.get("boxes"), list) or
+                        not 1 <= len(reference["boxes"]) <= 32):
+                    raise ValueError("Each CountGD++ target image needs 1–32 distinct boxes.")
                 boxes = reference["boxes"]
                 if any(not isinstance(box, list) or len(box) != 4 or
                        any(isinstance(n, bool) or not isinstance(n, (int, float)) or
                            (isinstance(n, float) and not math.isfinite(n)) for n in box)
                        for box in boxes):
                     raise ValueError("CountGD++ boxes need four finite numeric pixel coordinates.")
-                if len({tuple(box) for box in boxes}) != 10:
-                    raise ValueError("Each CountGD++ target image needs exactly 10 distinct boxes.")
+                if len({tuple(box) for box in boxes}) != len(boxes):
+                    raise ValueError("Each CountGD++ target image needs distinct boxes.")
                 image = _read_image(image_path)
-                _reference_boxes(boxes, *image.size)
+                try:
+                    _reference_boxes(boxes, *image.size)
+                except ValueError as exc:
+                    raise ValueError(f"CountGD++ {exc}") from exc
         if model_id == SAM3COUNT_MODEL_ID and (references or not label.strip()):
             raise ValueError("SAM3Count requires an Object description and no reference photos.")
         if model_id == SAM3_MODEL_ID:

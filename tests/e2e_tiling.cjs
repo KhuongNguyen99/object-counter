@@ -42,15 +42,25 @@ async function clearSuggestedBoxes(page) {
     await page.locator('#confidence').evaluate((input, value) => {
       input.value = value; input.dispatchEvent(new Event('input', { bubbles: true }));
     }, isYOLOE ? '0.25' : '0.5');
-    const proposalResponse = page.waitForResponse(response => response.url().endsWith('/api/reference-boxes') &&
-      response.request().method() === 'POST', { timeout: 240000 });
     const targetPhoto = path.join(root, 'test-results/fitting-debug/target-original.jpg');
     await page.locator(isYOLOE ? '#reference-gallery' : '#target-gallery').setInputFiles(
       isYOLOE ? path.join(root, 'test-results/fitting-debug/reference-original.jpg') : targetPhoto);
     await page.locator('#reference-editor').waitFor({ state: 'visible' });
+    await page.waitForFunction(() => document.querySelector('#editor-image').complete && document.querySelector('#editor-image').naturalWidth > 0);
+    await page.locator('#reference-select-areas').click();
+    await page.locator('#box-overlay').scrollIntoViewIfNeeded();
+    const bounds = await page.locator('#box-overlay').boundingBox();
+    await page.mouse.move(bounds.x + bounds.width * .01, bounds.y + bounds.height * .01);
+    await page.mouse.down();
+    await page.mouse.move(bounds.x + bounds.width * .99, bounds.y + bounds.height * .99, { steps: 12 });
+    await page.mouse.up();
+    const proposalResponse = page.waitForResponse(response => response.url().endsWith('/api/reference-boxes') &&
+      response.request().method() === 'POST', { timeout: 240000 });
+    await page.locator('#auto-detect-boxes').click();
     assert.equal((await proposalResponse).status(), 200, 'automatic reference boxes completed');
     await page.waitForFunction(() => document.querySelector('#auto-detect-boxes').getAttribute('aria-busy') !== 'true',
       null, { timeout: 240000 });
+    await page.locator('#reference-select-areas').click();
     let referenceBoxes;
     if (isYOLOE) {
       await clearSuggestedBoxes(page);
@@ -78,7 +88,8 @@ async function clearSuggestedBoxes(page) {
       assert.deepEqual(initial.references[0].boxes, [[1000, 1702, 1379, 2256]]);
     } else {
       assert.equal(initial.reference_mode, 'per_image');
-      assert.equal(initial.required_reference_boxes, 10);
+      assert.equal(initial.required_reference_boxes, null);
+      assert.equal(initial.recommended_reference_boxes, 10);
       assert.deepEqual(initial.references, []);
     }
     report.sessionId = initial.id;
