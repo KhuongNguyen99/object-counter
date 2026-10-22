@@ -6,6 +6,10 @@ The frontend and backend run in separate containers. Nginx serves the UI and pro
 
 ## Demos
 
+[![Watch the Countwell demo video](docs/images/demo-video-preview.png)](docs/videos/object-counter-demo.mp4)
+
+[Watch the demo video](docs/videos/object-counter-demo.mp4) (1 min 39 sec).
+
 Original photos are on the left; counted results are on the right.
 
 ![Demo 1: original photo beside counted result](docs/images/demo-01.jpg)
