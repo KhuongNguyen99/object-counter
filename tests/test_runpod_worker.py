@@ -38,8 +38,8 @@ def test_count_passes_exact_uploaded_bytes_and_omits_temporary_annotation(monkey
     payload = event(image_base64=encoded, label="  bolts  ", confidence=.9)
 
     class FakeEngine:
-        def count(self, model_id, references, image_paths, output_dir, confidence, label, reference_mode):
-            calls.append((model_id, references, image_paths, output_dir, confidence, label, reference_mode))
+        def count(self, model_id, references, image_paths, output_dir, confidence, label, reference_mode, annotate):
+            calls.append((model_id, references, image_paths, output_dir, confidence, label, reference_mode, annotate))
             assert references[0]["path"] == image_paths[0]
             assert Path(image_paths[0]).read_bytes() == base64.b64decode(encoded)
             assert Image.open(image_paths[0]).format == fmt
@@ -57,7 +57,7 @@ def test_count_passes_exact_uploaded_bytes_and_omits_temporary_annotation(monkey
     assert first["metrics"]["handler_ms"] >= 0
     assert calls[0][0] == COUNTGD_MODEL_ID
     assert calls[0][1][0]["boxes"] == [[1, 1, 4, 4]]
-    assert calls[0][4:] == (.9, "bolts", "per_image")
+    assert calls[0][4:] == (.9, "bolts", "per_image", False)
 
 
 def test_count_clips_edge_detections_without_changing_count(monkeypatch):

@@ -143,6 +143,7 @@ def handler(event: dict) -> dict:
                     confidence=job.get("confidence", .80),
                     label=job.get("label", "").strip(),
                     reference_mode="per_image",
+                    annotate=False,
                 )
                 if len(results) != 1:
                     raise RuntimeError("CountGD++ returned the wrong number of image results")

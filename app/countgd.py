@@ -167,7 +167,8 @@ class CountGDEngine:
             return self.model.prepare_conditioning(exemplar, boxes, [], [], captions=[caption])
 
     def count(self, references: list[dict], image_paths: list[str], output_dir: str,
-              confidence: float = .25, label: str = "", *, cache_reference: bool = True) -> list[dict]:
+              confidence: float = .25, label: str = "", *, cache_reference: bool = True,
+              annotate: bool = True) -> list[dict]:
         from .inference import _draw_detections, _read_image
 
         if not math.isfinite(confidence) or not 0 <= confidence <= 1:
@@ -217,14 +218,16 @@ class CountGDEngine:
             detections.sort(key=lambda detection: (detection["box"][1], detection["box"][0]))
             for index, detection in enumerate(detections, start=1):
                 detection["index"] = index
-            destination = destination_dir / f"{uuid4().hex}.jpg"
-            _draw_detections(image, detections, destination)
+            destination = destination_dir / f"{uuid4().hex}.jpg" if annotate else None
+            if destination is not None:
+                _draw_detections(image, detections, destination)
             warning = "Experimental model; review overlapping objects."
             if detection_limit_reached:
                 warning += " Detection limit reached in an image or tile; the count may be low."
             outputs.append({
                 "count": len(detections), "detections": detections,
-                "annotated_path": str(destination), "width": image.width, "height": image.height,
+                "annotated_path": str(destination) if destination is not None else None,
+                "width": image.width, "height": image.height,
                 "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
                 "warning": warning,
             })

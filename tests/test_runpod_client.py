@@ -62,7 +62,7 @@ def _count_output(*, box=None):
                     "preloaded_model": "count", "error": "top-secret-key"}}
 
 
-def test_async_submit_poll_and_sanitized_timings(monkeypatch):
+def test_pending_sync_response_polls_same_job_and_sanitizes_timings(monkeypatch):
     client, opener = _client([
         {"id": "job-1", "status": "IN_QUEUE"},
         {"id": "job-1", "status": "IN_PROGRESS"},
@@ -73,8 +73,11 @@ def test_async_submit_poll_and_sanitized_timings(monkeypatch):
     status = client.run({"action": "count", "image_base64": "abc"})
     assert status["status"] == "COMPLETED"
     assert [req.get_method() for req, _ in opener.calls] == ["POST", "GET", "GET"]
-    assert [req.full_url.split("/v2/endpoint-1/")[1] for req, _ in opener.calls] == [
-        "run", "status/job-1", "status/job-1"]
+    assert [req.full_url.split("/v2/endpoint-1/")[1] for req, _ in opener.calls[1:]] == [
+        "status/job-1", "status/job-1"]
+    assert "/runsync?wait=" in opener.calls[0][0].full_url
+    assert opener.calls[0][0].full_url.endswith("wait=300000")
+    assert opener.calls[0][1] <= client.timeout_seconds
     assert json.loads(opener.calls[0][0].data) == {"input": {"action": "count", "image_base64": "abc"}}
     assert opener.calls[0][0].get_header("Authorization") == "Bearer top-secret-key"
     assert client.last_job["job_id"] == "job-1"
@@ -90,6 +93,62 @@ def test_async_submit_poll_and_sanitized_timings(monkeypatch):
     assert "top-secret-key" not in repr(client.last_job)
 
 
+def test_completed_sync_response_needs_no_status_request():
+    client, opener = _client([{"id": "job-complete", "status": "COMPLETED",
+                               "output": _count_output()}])
+    assert client.run({"action": "count"})["status"] == "COMPLETED"
+    assert [req.get_method() for req, _ in opener.calls] == ["POST"]
+    assert "/runsync?wait=" in opener.calls[0][0].full_url
+    assert client.last_job["job_id"] == "job-complete"
+
+
+def test_explicit_submit_still_uses_async_queue_api():
+    client, opener = _client([{"id": "queued-job", "status": "IN_QUEUE"}])
+    assert client.submit({"action": "count"}) == "queued-job"
+    assert len(opener.calls) == 1
+    assert opener.calls[0][0].full_url.endswith("/run")
+
+
+def test_sync_post_network_failure_is_never_resubmitted():
+    failure = HTTPError("https://api.runpod.ai/v2/endpoint-1/runsync", 503,
+                        "top-secret-key provider detail", {}, BytesIO(b"secret image content"))
+    client, opener = _client([failure])
+    with pytest.raises(remote.RunPodError, match="503") as exc:
+        client.run({"action": "count"})
+    assert "secret" not in str(exc.value)
+    assert [req.get_method() for req, _ in opener.calls] == ["POST"]
+
+
+def test_completed_sync_response_after_deadline_requests_cancel(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(remote.time, "monotonic", lambda: clock[0])
+    client, opener = _client([{"id": "late-job", "status": "COMPLETED",
+                               "output": _count_output()},
+                              {"id": "late-job", "status": "CANCELLED"}],
+                             timeout_seconds=2)
+    original_open = opener.open
+
+    def slow_open(req, timeout):
+        if req.get_method() == "POST" and "/runsync?" in req.full_url:
+            clock[0] = 2.1
+        return original_open(req, timeout)
+
+    monkeypatch.setattr(opener, "open", slow_open)
+    with pytest.raises(remote.RunPodError, match="timed out"):
+        client.run({"action": "count"})
+    assert [req.get_method() for req, _ in opener.calls] == ["POST", "POST"]
+    assert opener.calls[-1][0].full_url.endswith("/cancel/late-job")
+
+
+def test_unknown_sync_status_requests_cancel():
+    client, opener = _client([{"id": "unknown-job", "status": "SURPRISE"},
+                              {"id": "unknown-job", "status": "CANCELLED"}])
+    with pytest.raises(remote.RunPodError, match="did not complete"):
+        client.run({"action": "count"})
+    assert [req.get_method() for req, _ in opener.calls] == ["POST", "POST"]
+    assert opener.calls[-1][0].full_url.endswith("/cancel/unknown-job")
+
+
 def test_timeout_requests_cancel_without_resubmission(monkeypatch):
     clock = [0.0]
     monkeypatch.setattr(remote.time, "monotonic", lambda: clock[0])
@@ -98,11 +157,41 @@ def test_timeout_requests_cancel_without_resubmission(monkeypatch):
         {"id": "job-2", "status": "IN_QUEUE"},
         {"id": "job-2", "status": "IN_PROGRESS"},
         {"id": "job-2", "status": "CANCELLED"},
-    ], timeout_seconds=.01)
+    ], timeout_seconds=1)
     with pytest.raises(remote.RunPodError, match="timed out"):
         client.run({"action": "suggest", "image_base64": "abc"})
     assert [req.get_method() for req, _ in opener.calls] == ["POST", "GET", "POST"]
+    assert opener.calls[0][0].full_url.endswith("wait=1000")
     assert opener.calls[-1][0].full_url.endswith("/cancel/job-2")
+
+
+def test_completed_status_read_after_deadline_requests_cancel(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(remote.time, "monotonic", lambda: clock[0])
+    client, opener = _client([{"id": "late-poll", "status": "IN_QUEUE"},
+                              {"id": "late-poll", "status": "COMPLETED",
+                               "output": _count_output()},
+                              {"id": "late-poll", "status": "CANCELLED"}],
+                             timeout_seconds=1)
+    original_open = opener.open
+
+    def slow_status(req, timeout):
+        if req.get_method() == "GET":
+            clock[0] = 1.1
+        return original_open(req, timeout)
+
+    monkeypatch.setattr(opener, "open", slow_status)
+    with pytest.raises(remote.RunPodError, match="timed out"):
+        client.run({"action": "count"})
+    assert [req.get_method() for req, _ in opener.calls] == ["POST", "GET", "POST"]
+    assert opener.calls[-1][0].full_url.endswith("/cancel/late-poll")
+
+
+def test_subsecond_run_timeout_rejected_before_post():
+    client, opener = _client([], timeout_seconds=.5)
+    with pytest.raises(ValueError, match="at least 1 second"):
+        client.run({"action": "count"})
+    assert not opener.calls
 
 
 def test_transient_status_errors_retry_within_budget_without_resubmitting(monkeypatch):
@@ -210,16 +299,38 @@ def test_endpoint_and_job_ids_cannot_inject_urls():
 
 
 def test_payload_limits_preserve_bytes_and_select_sync_once(monkeypatch):
-    monkeypatch.setattr(remote, "MAX_RUN_PAYLOAD_BYTES", 100)
     monkeypatch.setattr(remote, "MAX_SYNC_PAYLOAD_BYTES", 300)
-    client, opener = _client([{"id": "sync-job", "status": "COMPLETED",
+    client, opener = _client([{"id": "small-job", "status": "COMPLETED",
+                               "output": _count_output()},
+                              {"id": "sync-job", "status": "COMPLETED",
                                "output": _count_output()}])
+    client.run({"image_base64": "A" * 10})
     client.run({"image_base64": "A" * 100})
-    assert len(opener.calls) == 1
-    assert "/runsync?wait=" in opener.calls[0][0].full_url
+    assert len(opener.calls) == 2
+    assert all("/runsync?wait=" in req.full_url for req, _ in opener.calls)
+    assert [json.loads(req.data)["input"]["image_base64"] for req, _ in opener.calls] == [
+        "A" * 10, "A" * 100]
     with pytest.raises(ValueError, match="object storage"):
         client.run({"image_base64": "A" * 400})
+    assert len(opener.calls) == 2
+
+
+def test_explicit_submit_keeps_10_mb_request_cap():
+    client, opener = _client([])
+    with pytest.raises(ValueError, match="object storage"):
+        client.submit({"image_base64": "A" * remote.MAX_RUN_PAYLOAD_BYTES})
+    assert not opener.calls
+
+
+def test_run_preserves_payload_above_async_10_mb_cap():
+    image = "A" * remote.MAX_RUN_PAYLOAD_BYTES
+    client, opener = _client([{"id": "large-job", "status": "COMPLETED",
+                               "output": _count_output()}])
+    assert client.run({"image_base64": image})["status"] == "COMPLETED"
     assert len(opener.calls) == 1
+    assert "/runsync?wait=" in opener.calls[0][0].full_url
+    assert len(opener.calls[0][0].data) > remote.MAX_RUN_PAYLOAD_BYTES
+    assert json.loads(opener.calls[0][0].data)["input"]["image_base64"] == image
 
 
 def test_adapter_count_preserves_image_bytes_and_draws_locally(tmp_path):

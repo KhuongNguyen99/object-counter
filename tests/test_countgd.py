@@ -72,6 +72,43 @@ def test_result_keeps_one_detection_per_box_and_forwards_label(tmp_path):
     assert "Experimental model" in output["warning"]
 
 
+def test_per_image_count_skips_annotation_without_changing_detections(tmp_path, monkeypatch):
+    from app import inference
+
+    source = tmp_path / "image.png"
+    Image.new("RGB", (100, 100), "gray").save(source)
+    reference = {"path": str(source), "boxes": [[10, 10, 40, 40]]}
+    model = CountGDEngine.__new__(CountGDEngine)
+    model._predict = lambda *args: (np.array([[.5, .5, .2, .2]]), np.array([.9]))
+    local = model.count([reference], [str(source)], str(tmp_path / "local"))[0]
+    assert Path(local["annotated_path"]).is_file()
+
+    monkeypatch.setattr(inference, "_draw_detections", lambda *args: pytest.fail("annotation was drawn"))
+    engine = inference.InferenceEngine()
+    monkeypatch.setattr(engine, "_device", lambda: "cpu")
+    monkeypatch.setattr(engine, "_load_countgd_model", lambda _: model)
+    remote_dir = tmp_path / "remote"
+    remote = engine.count("countgd-plusplus", [reference], [str(source)], str(remote_dir),
+                          reference_mode="per_image", annotate=False)[0]
+    assert remote["annotated_path"] is None
+    assert list(remote_dir.iterdir()) == []
+    for field in ("count", "detections", "width", "height", "warning"):
+        assert remote[field] == local[field]
+
+
+@pytest.mark.parametrize("model_id,reference_mode,annotate", [
+    ("countgd-plusplus", "shared", False),
+    ("yoloe-26n-seg", "shared", False),
+    ("countgd-plusplus", "per_image", None),
+])
+def test_skip_annotation_only_accepts_per_image_countgd(tmp_path, model_id, reference_mode, annotate):
+    from app.inference import InferenceEngine
+
+    with pytest.raises(ValueError, match="Skipping annotation"):
+        InferenceEngine().count(model_id, [{"path": "unused", "boxes": []}], ["unused"],
+                                str(tmp_path), reference_mode=reference_mode, annotate=annotate)
+
+
 @pytest.mark.parametrize("thin_is_target", [True, False])
 def test_extreme_aspect_ratio_is_rejected_before_official_resize(thin_is_target):
     engine = CountGDEngine.__new__(CountGDEngine)

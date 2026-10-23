@@ -1,6 +1,6 @@
 # RunPod Serverless
 
-The browser and API run locally; CountGD++ counting and FastSAM reference-box suggestions run on a RunPod queue endpoint. Counting uses reference boxes drawn on each target image. Original image bytes are sent to the worker; annotations are drawn locally after the response.
+The browser and API run locally; CountGD++ counting and FastSAM reference-box suggestions run on a RunPod queue endpoint. Counting uses reference boxes drawn on each target image. Original image bytes are sent to the worker; annotations are drawn locally after the response. The API waits for the result through `/runsync`, falling back to status polling when a job outlasts that wait. The browser checks pending counts every half second.
 
 ## Launch
 
@@ -92,6 +92,6 @@ This also deletes any retained winner. Keep the manifest until cleanup completes
 
 ## Image size limits
 
-The app sends up to 10 MB of serialized JSON through `/run` and larger requests, up to 20 MB, through `/runsync`. Base64 adds roughly one third to image size, so an original image near **15 MB** can exceed the limit once JSON and boxes are included. Oversized images are rejected without recompression; larger originals require an object-storage transfer implementation. The benchmark currently uses the stricter 10 MB serialized limit, roughly **7.5 MB** of original image bytes.
+The app sends up to 20 MB of serialized JSON through `/runsync`. Base64 adds roughly one third to image size, so an original image near **15 MB** can exceed the limit once JSON and boxes are included. Oversized images are rejected without recompression; larger originals require an object-storage transfer implementation. The standalone GPU-comparison benchmark uses asynchronous `/run` and its stricter 10 MB serialized limit, roughly **7.5 MB** of original image bytes.
 
 Official references: [endpoint creation](https://docs.runpod.io/api-reference-v2/serverless/create-a-serverless-endpoint), [GPU catalog](https://docs.runpod.io/api-reference-v2/catalog/list-gpu-types), [billing history](https://docs.runpod.io/api-reference-v2/billing/get-serverless-billing-history), [billing phases](https://docs.runpod.io/serverless/pricing), and [request operations](https://docs.runpod.io/serverless/endpoints/operation-reference).

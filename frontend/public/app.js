@@ -825,7 +825,7 @@
 
   function schedulePoll() {
     stopPolling();
-    if (hasPending() && !state.busy) state.polling = setTimeout(refreshSession, 1600);
+    if (hasPending() && !state.busy) state.polling = setTimeout(refreshSession, 500);
   }
 
   async function refreshSession() {

@@ -87,7 +87,7 @@ def _safe_metrics(value, *, api_key=""):
 
 
 class RunPodClient:
-    """Small queue client with no automatic submission or redirect retries."""
+    """RunPod client with no automatic submission or redirect retries."""
 
     def __init__(self, api_key=None, endpoint_id=None, timeout_seconds=None, *, opener=None):
         self.api_key = api_key if api_key is not None else os.environ.get("RUNPOD_API_KEY", "")
@@ -199,6 +199,8 @@ class RunPodClient:
                     raise RunPodError("RunPod returned an unexpected job ID.")
                 status = data.get("status")
                 if status == "COMPLETED":
+                    if time.monotonic() >= deadline:
+                        raise RunPodError("RunPod job timed out; cancellation was requested.")
                     completed = True
                     return data
                 if status in ("FAILED", "CANCELLED", "TIMED_OUT"):
@@ -217,36 +219,44 @@ class RunPodClient:
                     pass
 
     def run(self, job_input):
-        """Submit and wait for one job; return the complete RunPod status response."""
+        """Wait on the original request, then poll the same job if still pending."""
         started = time.monotonic()
+        if not isinstance(job_input, dict):
+            raise ValueError("RunPod input must be an object.")
         body_size = len(self._encode({"input": job_input}))
         if body_size > MAX_SYNC_PAYLOAD_BYTES:
             raise ValueError(
                 "Image exceeds RunPod's 20 MB request limit after base64 encoding. "
                 "Configure external object storage for full-resolution transfer."
             )
-        if body_size <= MAX_RUN_PAYLOAD_BYTES:
-            job_id = self.submit(job_input)
-            response = None
-        else:
-            # /runsync is documented to allow 20 MB, versus /run's 10 MB.
-            # Submit once; if the wait window ends with a job ID, poll it.
-            if self.timeout_seconds < 1:
-                raise ValueError("RUNPOD_TIMEOUT_SECONDS must be at least 1 for large images.")
-            wait_ms = int(min(300, self.timeout_seconds) * 1000)
-            response = self._request("POST", f"runsync?wait={wait_ms}", {"input": job_input},
-                                     timeout=min(305, self.timeout_seconds + 5),
-                                     max_payload_bytes=MAX_SYNC_PAYLOAD_BYTES)
-            job_id = response.get("id")
-            if not isinstance(job_id, str) or not _ID.fullmatch(job_id):
-                raise RunPodError("RunPod did not return a valid job ID.")
+        remaining = self.timeout_seconds - (time.monotonic() - started)
+        if remaining < 1:
+            raise ValueError("RUNPOD_TIMEOUT_SECONDS must allow at least 1 second for /runsync.")
+        # Leave transport time to receive a pending job ID before the deadline.
+        wait_ms = max(1000, int(min(300, remaining * .95) * 1000))
+        response = self._request("POST", f"runsync?wait={wait_ms}", {"input": job_input},
+                                 timeout=min(305, remaining),
+                                 max_payload_bytes=MAX_SYNC_PAYLOAD_BYTES)
+        job_id = response.get("id")
+        if not isinstance(job_id, str) or not _ID.fullmatch(job_id):
+            raise RunPodError("RunPod did not return a valid job ID.")
         self.last_job = {"job_id": job_id}
+        pending = response.get("status") in ("IN_QUEUE", "IN_PROGRESS")
         try:
-            if response is None or response.get("status") in ("IN_QUEUE", "IN_PROGRESS"):
+            if pending:
                 response = self.wait(job_id, timeout_seconds=max(0, self.timeout_seconds -
                                                                  (time.monotonic() - started)))
             elif response.get("status") != "COMPLETED":
                 raise RunPodError("RunPod job did not complete successfully.")
+            elif time.monotonic() - started >= self.timeout_seconds:
+                raise RunPodError("RunPod job timed out; cancellation was requested.")
+        except BaseException:
+            if not pending:
+                try:
+                    self.cancel(job_id)
+                except BaseException:
+                    pass
+            raise
         finally:
             self.last_job["wall_ms"] = round((time.monotonic() - started) * 1000, 2)
         for key in ("delayTime", "executionTime"):

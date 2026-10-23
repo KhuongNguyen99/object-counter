@@ -154,6 +154,7 @@ class InferenceEngine:
         *,
         reference_strategy: str = "mean",
         reference_mode: str = "shared",
+        annotate: bool = True,
     ) -> list[dict]:
         """Combine exemplars once, then infer each target at native pixel resolution.
 
@@ -169,6 +170,8 @@ class InferenceEngine:
             raise ValueError("Per-object reference strategy is supported only for YOLOE.")
         if reference_mode not in ("shared", "per_image") or (reference_mode == "per_image" and model_id != COUNTGD_MODEL_ID):
             raise ValueError("Per-image reference mode is supported only for CountGD++.")
+        if not isinstance(annotate, bool) or (not annotate and (model_id != COUNTGD_MODEL_ID or reference_mode != "per_image")):
+            raise ValueError("Skipping annotation is supported only for per-image CountGD++.")
         if not image_paths or (not references and model_id != SAM3COUNT_MODEL_ID):
             raise ValueError("Provide reference boxes and at least one image to count.")
         if model_id == COUNTGD_MODEL_ID and reference_mode == "per_image":
@@ -244,8 +247,10 @@ class InferenceEngine:
             if model_id == COUNTGD_MODEL_ID:
                 model = self._load_countgd_model(device)
                 if reference_mode == "per_image":
+                    count_options = {"annotate": False} if not annotate else {}
                     return [result for reference, image_path in zip(references, image_paths, strict=True)
-                            for result in model.count([reference], [image_path], str(directory), confidence, label)]
+                            for result in model.count([reference], [image_path], str(directory), confidence, label,
+                                                      **count_options)]
                 return model.count(references, image_paths, str(directory), confidence, label)
             if model_id == PETDINO_MODEL_ID:
                 if self._model_id != PETDINO_MODEL_ID or self._model is None:
