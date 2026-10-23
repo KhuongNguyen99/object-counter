@@ -48,6 +48,8 @@ Use `ghcr.io/khuongnguyen99/object-counter-worker@sha256:<digest>` for the bench
 
 ## Compare A5000 and L4
 
+See the [completed A5000/L4 comparison](runpod-benchmark.md) for measured timings, costs, and startup behavior.
+
 Create a fixture manifest with a `cases` array. Each case supplies a unique `id`, `action` (`count` or `suggest`), an `image` path relative to the manifest, and an optional `label`. Count cases also supply `boxes` in `[x1, y1, x2, y2]` pixel coordinates and `confidence: 0.80`. Use the actual selected boxes on that same image. Add both count and suggest cases for each representative original image.
 
 ```powershell

@@ -111,6 +111,7 @@ def budget_preflight(gpus, *, budget_usd, trial_seconds, disk_gb, cleanup_second
 
 
 def wait_stopped(api, endpoint_id, deadline):
+    scaled_down = {"IDLE", "INITIALIZING", "THROTTLED"}
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -118,7 +119,10 @@ def wait_stopped(api, endpoint_id, deadline):
         workers = api.request("GET", f"/serverless/{endpoint_id}/workers", timeout=min(20, remaining))
         if not isinstance(workers.get("workers"), list):
             raise ApiError("RunPod worker listing is missing its workers array.")
-        if not workers["workers"]:
+        if all(isinstance(worker, dict) and
+               isinstance(worker.get("status", worker.get("state")), str) and
+               worker.get("status", worker.get("state")).upper() in scaled_down
+               for worker in workers["workers"]):
             return True
         time.sleep(min(2, max(0, deadline - time.monotonic())))
 

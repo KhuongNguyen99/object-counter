@@ -42,7 +42,7 @@ Open [localhost:8080](http://localhost:8080). Backend API docs are at [127.0.0.1
 
 Stop the app with `docker compose stop`. Saved counts, photos, and results stay in the `counter-data` volume at `/app/data`. `docker compose down -v` deletes that data.
 
-To use a RunPod model worker instead of a local GPU, set the RunPod fields in `.env` and run `python run.py --runpod`. Add `--env-file <path>` to use another settings file. See [RunPod setup and GPU comparison](docs/runpod.md).
+To use a RunPod model worker instead of a local GPU, set the RunPod fields in `.env` and run `python run.py --runpod`. Add `--env-file <path>` to use another settings file. See [RunPod setup](docs/runpod.md) and the [measured A5000/L4 comparison](docs/runpod-benchmark.md).
 
 ## Repository structure
 

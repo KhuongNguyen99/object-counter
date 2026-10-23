@@ -6,9 +6,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from scripts import runpod_benchmark as benchmark_module
 from scripts.runpod_benchmark import (benchmark, budget_preflight, cost_envelope,
                                      prepare_cases, read_billing, sample_response, save_report,
-                                     summarize_trial, verify_identity)
+                                     summarize_trial, verify_identity, wait_stopped)
 from scripts.runpod_deploy import ApiError, select_gpu
 from test_runpod_deploy import CATALOG, FakeApi
 
@@ -28,6 +29,45 @@ def test_report_csv_keeps_single_crlf_and_atomic_text_files(tmp_path):
         assert (tmp_path / name).is_file()
     assert b"\r\r\n" not in (tmp_path / "costs.csv").read_bytes()
     assert b"\r\r\n" not in (tmp_path / "samples.csv").read_bytes()
+
+
+def test_parked_workers_are_verified_scaled_down_without_empty_list():
+    class Api:
+        def request(self, method, path, timeout):
+            assert method == "GET" and path == "/serverless/owned/workers"
+            return {"workers": [{"status": "IDLE"}, {"status": "INITIALIZING"},
+                                {"status": "THROTTLED"}]}
+
+    assert wait_stopped(Api(), "owned", benchmark_module.time.monotonic() + 5)
+
+
+def test_running_worker_must_transition_to_parked_state(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(benchmark_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(benchmark_module.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+
+    class Api:
+        calls = 0
+
+        def request(self, method, path, timeout):
+            self.calls += 1
+            return {"workers": [{"status": "RUNNING" if self.calls == 1 else "IDLE"}]}
+
+    api = Api()
+    assert wait_stopped(api, "owned", 5)
+    assert api.calls == 2 and clock[0] == 2
+
+
+def test_unknown_worker_state_remains_unverified(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(benchmark_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(benchmark_module.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+
+    class Api:
+        def request(self, method, path, timeout):
+            return {"workers": [{"status": "UNKNOWN"}]}
+
+    assert wait_stopped(Api(), "owned", 3) is False
 
 
 def response(gpu="NVIDIA RTX A5000", *, cold=False, worker="worker-1", count=7):
