@@ -2,12 +2,14 @@
 
 import io
 import json
+from pathlib import Path
 from urllib.error import HTTPError
 
 import pytest
 
+from scripts import runpod_deploy
 from scripts.runpod_deploy import (ApiError, OwnedEndpoints, RunPodApi, endpoint_body,
-                                  normalize_gpu, select_gpu)
+                                  normalize_gpu, save_json, select_gpu)
 
 
 CATALOG = [
@@ -16,6 +18,55 @@ CATALOG = [
     {"id": "NVIDIA L4", "name": "L4", "pool": "ADA_24", "price": {"serverless": .684}},
     {"id": "NVIDIA GeForce RTX 4090", "name": "RTX 4090", "pool": "ADA_24", "price": {"serverless": 1.1}},
 ]
+
+
+def sharing_error(winerror):
+    error = PermissionError(13, "file in use")
+    error.winerror = winerror
+    return error
+
+
+def test_atomic_json_retries_transient_smb_replace_and_preserves_old_until_success(tmp_path, monkeypatch):
+    target = tmp_path / "report.json"
+    target.write_text('{"old": true}')
+    replace = Path.replace
+    attempts, sleeps = [], []
+
+    def blocked_twice(source, destination):
+        if len(attempts) < 2:
+            assert target.read_text() == '{"old": true}'
+        attempts.append(1)
+        if len(attempts) <= 2:
+            raise sharing_error(5)
+        return replace(source, destination)
+
+    monkeypatch.setattr(Path, "replace", blocked_twice)
+    monkeypatch.setattr(runpod_deploy.time, "sleep", sleeps.append)
+    save_json(target, {"new": True})
+    assert json.loads(target.read_text()) == {"new": True}
+    assert len(attempts) == 3 and sleeps == [.05, .1]
+
+
+@pytest.mark.parametrize("winerror,expected_retries", [(5, 7), (13, 0)])
+def test_atomic_json_preserves_previous_file_when_replace_is_denied(
+        tmp_path, monkeypatch, winerror, expected_retries):
+    target = tmp_path / "resources.json"
+    target.write_text('{"old": true}')
+    attempts, sleeps = [], []
+
+    def denied(source, destination):
+        attempts.append(1)
+        raise sharing_error(winerror)
+
+    monkeypatch.setattr(Path, "replace", denied)
+    monkeypatch.setattr(runpod_deploy.time, "sleep", sleeps.append)
+    with pytest.raises(PermissionError) as exc:
+        save_json(target, {"new": True})
+    assert exc.value.winerror == winerror
+    assert target.read_text() == '{"old": true}'
+    assert json.loads((tmp_path / "resources.json.tmp").read_text()) == {"new": True}
+    assert len(sleeps) == expected_retries
+    assert len(attempts) == expected_retries + 1
 
 
 class FakeApi:

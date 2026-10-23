@@ -7,7 +7,8 @@ from types import SimpleNamespace
 import pytest
 
 from scripts.runpod_benchmark import (benchmark, budget_preflight, cost_envelope,
-                                     prepare_cases, read_billing, sample_response, summarize_trial, verify_identity)
+                                     prepare_cases, read_billing, sample_response, save_report,
+                                     summarize_trial, verify_identity)
 from scripts.runpod_deploy import ApiError, select_gpu
 from test_runpod_deploy import CATALOG, FakeApi
 
@@ -19,6 +20,14 @@ def fixture(tmp_path):
     path.write_text(json.dumps({"cases": [{"id": "fitting", "image": "original.png", "action": "count",
                                           "boxes": [[1, 2, 3, 4]], "confidence": .80}]}))
     return path
+
+
+def test_report_csv_keeps_single_crlf_and_atomic_text_files(tmp_path):
+    save_report(tmp_path, {"status": "running", "trials": []})
+    for name in ("report.json", "report.md", "costs.csv", "samples.csv"):
+        assert (tmp_path / name).is_file()
+    assert b"\r\r\n" not in (tmp_path / "costs.csv").read_bytes()
+    assert b"\r\r\n" not in (tmp_path / "samples.csv").read_bytes()
 
 
 def response(gpu="NVIDIA RTX A5000", *, cold=False, worker="worker-1", count=7):

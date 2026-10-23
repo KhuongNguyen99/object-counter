@@ -33,12 +33,27 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def save_json(path, value):
+def save_text(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    with temporary.open("w", encoding="utf-8", newline="") as stream:
+        stream.write(value)
+    # SMB reports a reader blocking atomic replace as WinError 5, also used by ACL denial.
+    # Retry only replace on an existing target; a persistent denial still raises unchanged.
+    for delay in (.05, .1, .2, .4, .8, 1.0, 1.0):
+        try:
+            temporary.replace(path)
+            return
+        except PermissionError as exc:
+            if getattr(exc, "winerror", None) not in (5, 32, 33) or not path.exists():
+                raise
+            time.sleep(delay)
     temporary.replace(path)
+
+
+def save_json(path, value):
+    save_text(path, json.dumps(value, indent=2, allow_nan=False) + "\n")
 
 
 class ApiError(RuntimeError):

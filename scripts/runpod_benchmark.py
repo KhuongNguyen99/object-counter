@@ -22,6 +22,7 @@ import base64
 import csv
 from datetime import datetime, timedelta, timezone
 import hashlib
+import io
 import json
 import math
 import os
@@ -36,7 +37,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.runpod_deploy import (ApiError, OwnedEndpoints, RunPodApi, load_api_key,
-                                  normalize_gpu, save_json, select_gpu, utc_now)
+                                  normalize_gpu, save_json, save_text, select_gpu, utc_now)
 
 SOURCES = {
     "api_schema": "https://api.runpod.io/v2/openapi.json",
@@ -217,7 +218,6 @@ def summarize_trial(trial):
 
 def save_report(output, report):
     output = Path(output)
-    save_json(output / "report.json", report)
     rows = []
     lines = ["# RunPod GPU comparison", "", f"Status: {report.get('status', 'running')}", "",
              "Latency uses identical original image bytes and request settings. The first request includes cold startup; "
@@ -255,19 +255,21 @@ def save_report(output, report):
     lines += ["", "Sources: " + ", ".join(f"[{name}]({url})" for name, url in SOURCES.items()), ""]
     report["cost_summary"] = rows
     save_json(output / "report.json", report)
-    (output / "report.md").write_text("\n".join(lines), encoding="utf-8")
-    with (output / "costs.csv").open("w", newline="", encoding="utf-8") as stream:
-        fields = list(rows[0]) if rows else ["gpu", "completed_jobs", "observed_billed_usd"]
-        writer = csv.DictWriter(stream, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows(rows)
+    save_text(output / "report.md", "\n".join(lines))
+    stream = io.StringIO(newline="")
+    fields = list(rows[0]) if rows else ["gpu", "completed_jobs", "observed_billed_usd"]
+    writer = csv.DictWriter(stream, fieldnames=fields)
+    writer.writeheader()
+    writer.writerows(rows)
+    save_text(output / "costs.csv", stream.getvalue())
     samples = [{"gpu": trial["gpu"]["name"], **{key: sample[key] for key in
                 ("case_id", "repeat", "job_id", "worker_id", "cold_start", "wall_ms", "handler_ms", "executionTime", "delayTime")}}
                for trial in report.get("trials", []) for sample in trial.get("samples", [])]
-    with (output / "samples.csv").open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(samples[0]) if samples else ["gpu", "case_id"])
-        writer.writeheader()
-        writer.writerows(samples)
+    stream = io.StringIO(newline="")
+    writer = csv.DictWriter(stream, fieldnames=list(samples[0]) if samples else ["gpu", "case_id"])
+    writer.writeheader()
+    writer.writerows(samples)
+    save_text(output / "samples.csv", stream.getvalue())
 
 
 def benchmark(args, api, client_factory):
