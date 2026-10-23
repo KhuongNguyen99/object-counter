@@ -4,7 +4,7 @@ The browser and API run locally; CountGD++ counting and FastSAM reference-box su
 
 New counts save detection coordinates and the original photo without generating an annotated JPEG. The browser draws the boxes over its cached photo and creates a full-resolution annotated image when Download is clicked. Restored sessions load the saved original and draw the saved detections. Pending sessions use a revision-based long poll (`GET /api/sessions/{id}?after=<revision>&wait=25`), which returns as soon as the session changes; no half-second browser polling is needed. Run one API worker, as the counting queue and completion notifications are process-local.
 
-See the [latest warm A5000 frontend test](a5000-metadata-warm-frontend-test.md) for timing, estimated cost, and comparisons with the [previous cloud test](a5000-optimized-warm-frontend-test.md) and [local PC](local-frontend-test.md).
+See the [latest warm A5000 frontend test](a5000-pooled-warm-frontend-test.md) for timing, connection reuse, estimated cost, and comparisons with the [previous cloud test](a5000-metadata-warm-frontend-test.md) and [local PC](local-frontend-test.md).
 
 ## Launch
 
