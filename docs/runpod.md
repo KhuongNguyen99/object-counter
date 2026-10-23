@@ -18,6 +18,8 @@ RUNPOD_BENCHMARK_BUDGET_USD=5.00
 python run.py --runpod
 ```
 
+To use another private settings file, add `--env-file .env.runpod`. Both `.env` and `.env.*` are excluded from Git and Docker build contexts.
+
 Use an endpoint running this repository's worker image. The endpoint must have minimum workers **0** and maximum workers **1** for the setup described here. The API key stays on the local backend; do not put it in frontend settings, commit it, or include it in an image. Remote mode supports CountGD++ per-image counting and FastSAM suggestions.
 
 ## Publish the worker

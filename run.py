@@ -84,7 +84,7 @@ def launch(args):
     if sys.version_info < (3, 11):
         raise RuntimeError("Install Python 3.11 or newer, then run this script again.")
     env = os.environ.copy()
-    load_dotenv(ROOT / ".env", env)
+    load_dotenv(args.env_file, env)
     backend = "local" if args.cpu or args.gpu else ("runpod" if args.runpod else
               env.get("INFERENCE_BACKEND", "local").lower())
     if backend not in {"local", "runpod"}:
@@ -150,6 +150,8 @@ def main(argv=None):
     mode.add_argument("--gpu", action="store_true", help="Require a working NVIDIA GPU in Docker")
     mode.add_argument("--runpod", action="store_true", help="Use the configured RunPod Serverless endpoint")
     parser.add_argument("--no-build", action="store_true", help="Start existing app images without building or preparing model assets")
+    parser.add_argument("--env-file", type=Path, default=ROOT / ".env",
+                        help="Read private settings from this file (default: .env)")
     args = parser.parse_args(argv)
     try:
         launch(args)

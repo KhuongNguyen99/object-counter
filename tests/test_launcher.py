@@ -381,3 +381,20 @@ def test_unsupported_docker_environment_fails_before_build(
     assert expected in capsys.readouterr().err
     assert not compose_calls(calls, "config")
     assert not compose_calls(calls, "up")
+
+
+def test_runpod_can_read_an_alternate_private_env_file(monkeypatch, tmp_path):
+    calls = install_fake_docker(monkeypatch)
+    settings = tmp_path / ".env.runpod"
+    seen = []
+
+    def private_settings(path, env):
+        seen.append(path)
+        env.update(RUNPOD_API_KEY="test-key", RUNPOD_ENDPOINT_ID="endpoint-123")
+
+    monkeypatch.setattr(launcher, "load_dotenv", private_settings)
+    monkeypatch.setattr(launcher, "gpu_available", lambda: pytest.fail("No local GPU probe"))
+    monkeypatch.setattr(launcher, "prepare_assets", lambda: pytest.fail("No model downloads"))
+    assert launcher.main(["--runpod", "--env-file", str(settings)]) == 0
+    assert seen == [settings]
+    assert compose_calls(calls, "up")
