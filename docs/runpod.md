@@ -52,7 +52,7 @@ python scripts/runpod_benchmark.py --image ghcr.io/khuongnguyen99/object-counter
 
 The defaults select **RTX A5000** and **NVIDIA L4**, with three warm repeats after each case's first call. The tool queries current GPU pools and prices, excludes other cards, verifies the deployed settings and actual worker GPU, and verifies that warm repeats use the same worker. Only the endpoint's first request is a full cold start; later cases have their first-call timings reported separately.
 
-Each endpoint has one GPU, minimum zero workers, maximum one worker, a 30-second idle timeout, and a 300-second execution timeout. Trials are limited to 900 seconds per GPU. Before creating resources, the tool reserves the quoted full trial lifetime plus cleanup time and a 25% margin against the $5 budget. These are local safeguards, **not a provider-enforced account spending cap**. The first GPU must stop before the second runs.
+Each endpoint has one GPU, minimum zero workers, maximum one worker, a 30-second idle timeout, and a 300-second execution timeout. New endpoints require CUDA 12.8 or newer through `gpu.minCudaVersion`, matching the worker's PyTorch CUDA build; the setting is verified before jobs run. Trials are limited to 900 seconds per GPU. Before creating resources, the tool reserves the quoted full trial lifetime plus cleanup time and a 25% margin against the $5 budget. These are local safeguards, **not a provider-enforced account spending cap**. The first GPU must stop before the second runs.
 
 Reports and the ownership manifest are saved under the output directory:
 

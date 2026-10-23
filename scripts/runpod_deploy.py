@@ -26,6 +26,7 @@ if str(ROOT) not in sys.path:
 
 API_BASE = "https://api.runpod.io/v2"
 ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
+MIN_CUDA_VERSION = "12.8"  # Worker images use the PyTorch cu128 wheels.
 
 
 def utc_now():
@@ -122,7 +123,8 @@ def endpoint_body(name, image, gpu, *, timeout_seconds=300, idle_seconds=30,
     if not 1 <= timeout_seconds <= 1800 or not 1 <= idle_seconds <= 60 or not 1 <= disk_gb <= 100:
         raise ValueError("Timeout, idle timeout, or disk size exceeds the supported benchmark limits.")
     return {"name": name, "image": image, "type": "QUEUE", "disk": disk_gb,
-            "gpu": {"pools": [gpu["pool"]], "excludedTypes": gpu["excluded_types"], "count": 1},
+            "gpu": {"pools": [gpu["pool"]], "excludedTypes": gpu["excluded_types"], "count": 1,
+                    "minCudaVersion": MIN_CUDA_VERSION},
             "workers": {"min": 0, "max": 1, "idleTimeout": idle_seconds},
             "scaling": {"type": "QUEUE_DELAY", "queueDelay": 1},
             "timeout": int(timeout_seconds * 1000), "flashboot": "OFF",
@@ -172,6 +174,7 @@ class OwnedEndpoints:
         if (live.get("image") != image or live.get("type") != "QUEUE" or
                 live.get("workers") != body["workers"] or live.get("timeout") != body["timeout"] or
                 actual_gpu.get("count") != 1 or actual_gpu.get("pools") != expected_gpu["pools"] or
+                actual_gpu.get("minCudaVersion") != MIN_CUDA_VERSION or
                 sorted(actual_gpu.get("excludedTypes", [])) != sorted(expected_gpu["excludedTypes"])):
             raise ApiError("Created endpoint settings differ from the requested GPU and spending safeguards.")
         return record

@@ -59,7 +59,9 @@ class FakeApi:
 def test_exact_gpu_selection_excludes_every_other_card_in_pool():
     gpu = select_gpu(CATALOG, "RTX A5000")
     body = endpoint_body("benchmark", "ghcr.io/example/worker@sha256:abc", gpu)
-    assert body["gpu"] == {"pools": ["AMPERE_24"], "excludedTypes": ["NVIDIA GeForce RTX 3090"], "count": 1}
+    assert body["gpu"] == {"pools": ["AMPERE_24"], "excludedTypes": ["NVIDIA GeForce RTX 3090"],
+                           "count": 1, "minCudaVersion": "12.8"}
+    assert "allowedCudaVersions" not in body["gpu"]
     assert body["workers"] == {"min": 0, "max": 1, "idleTimeout": 30}
     assert body["timeout"] == 300000
     assert body["flashboot"] == "OFF"
@@ -162,3 +164,20 @@ def test_definite_rejected_create_needs_no_resource_deletion(tmp_path):
         owned.create("worker:v1", select_gpu(CATALOG, "L4"))
     assert not owned.cleanup()
     assert owned.data["resources"][0]["state"] == "rejected"
+
+
+@pytest.mark.parametrize("reported_version", [None, "12.6"])
+def test_missing_or_changed_cuda_floor_rejects_created_endpoint(tmp_path, reported_version):
+    class WrongCudaApi(FakeApi):
+        def request(self, method, path, data=None, **kwargs):
+            value = super().request(method, path, data, **kwargs)
+            if method == "GET" and path.startswith("/serverless/"):
+                value = {**value, "gpu": {**value["gpu"], "minCudaVersion": reported_version}}
+            return value
+
+    api = WrongCudaApi()
+    owned = OwnedEndpoints(api, tmp_path / "resources.json")
+    with pytest.raises(ApiError, match="spending safeguards"):
+        owned.create("worker:v1", select_gpu(CATALOG, "L4"))
+    assert not owned.cleanup()
+    assert not api.live
