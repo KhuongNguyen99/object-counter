@@ -76,7 +76,7 @@ def test_pending_sync_response_polls_same_job_and_sanitizes_timings(monkeypatch)
     assert [req.full_url.split("/v2/endpoint-1/")[1] for req, _ in opener.calls[1:]] == [
         "status/job-1", "status/job-1"]
     assert "/runsync?wait=" in opener.calls[0][0].full_url
-    assert opener.calls[0][0].full_url.endswith("wait=300000")
+    assert opener.calls[0][0].full_url.endswith("wait=270000")
     assert opener.calls[0][1] <= client.timeout_seconds
     assert json.loads(opener.calls[0][0].data) == {"input": {"action": "count", "image_base64": "abc"}}
     assert opener.calls[0][0].get_header("Authorization") == "Bearer top-secret-key"
@@ -91,6 +91,40 @@ def test_pending_sync_response_polls_same_job_and_sanitizes_timings(monkeypatch)
     assert client.last_job["worker_metrics"]["startup_model_load_ms"] == 92
     assert "error" not in client.last_job["worker_metrics"]
     assert "top-secret-key" not in repr(client.last_job)
+
+
+@pytest.mark.parametrize("budget", [2, 5, 300, 600])
+def test_sync_wait_leaves_response_time_before_http_deadline(budget):
+    client, opener = _client([{"id": "job-complete", "status": "COMPLETED",
+                               "output": _count_output()}], timeout_seconds=budget)
+    assert client.run({"action": "count"})["status"] == "COMPLETED"
+    req, http_timeout = opener.calls[0]
+    wait_seconds = int(req.full_url.rsplit("wait=", 1)[1]) / 1000
+    assert 1 <= wait_seconds <= 270
+    assert wait_seconds < http_timeout
+    if budget >= 5:
+        assert http_timeout - wait_seconds >= 4
+
+
+def test_queued_sync_response_near_wait_boundary_can_still_be_polled(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(remote.time, "monotonic", lambda: clock[0])
+    client, opener = _client([{"id": "cold-job", "status": "IN_QUEUE"},
+                              {"id": "cold-job", "status": "COMPLETED",
+                               "output": _count_output()}], timeout_seconds=300)
+    original_open = opener.open
+
+    def queued_response(req, timeout):
+        if req.get_method() == "POST":
+            wait_seconds = int(req.full_url.rsplit("wait=", 1)[1]) / 1000
+            clock[0] = wait_seconds + 1
+            assert clock[0] < timeout
+        return original_open(req, timeout)
+
+    monkeypatch.setattr(opener, "open", queued_response)
+    assert client.run({"action": "count"})["status"] == "COMPLETED"
+    assert [req.get_method() for req, _ in opener.calls] == ["POST", "GET"]
+    assert opener.calls[0][0].full_url.endswith("wait=270000")
 
 
 def test_completed_sync_response_needs_no_status_request():

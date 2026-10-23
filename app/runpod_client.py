@@ -279,12 +279,15 @@ class RunPodClient:
         remaining = self.timeout_seconds - (time.monotonic() - started)
         if remaining < 1:
             raise ValueError("RUNPOD_TIMEOUT_SECONDS must allow at least 1 second for /runsync.")
-        # Leave transport time to receive a pending job ID before the deadline.
-        wait_ms = max(1000, int(min(300, remaining * .95) * 1000))
+        # RunPod may hold /runsync until its wait expires. Return the queued
+        # job ID before the HTTP deadline, then continue through /status.
+        # Stay clear of the provider's 300-second synchronous wait boundary.
+        request_timeout = min(305, remaining)
+        wait_ms = max(1000, int(min(270, request_timeout - 5) * 1000))
         self._run_transport_timings = []
         try:
             response = self._request("POST", f"runsync?wait={wait_ms}", {"input": job_input},
-                                     timeout=min(305, remaining),
+                                     timeout=request_timeout,
                                      max_payload_bytes=MAX_SYNC_PAYLOAD_BYTES)
         except BaseException:
             self._run_transport_timings = None
