@@ -1,0 +1,38 @@
+name: Publish RunPod worker
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: runpod-worker-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Make room for CUDA dependencies
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h /
+      - name: Prepare detector checkpoint
+        run: |
+          mkdir -p models/countgd
+          python scripts/download_models.py --model-dir models --models FastSAM-s
+      - name: Build worker with bundled models
+        run: |
+          docker build --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128 -t countwell-backend:runpod-base .
+          docker build -f Dockerfile.runpod --build-arg WORKER_BUILD_REVISION="$GITHUB_SHA" --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" -t "ghcr.io/${GITHUB_REPOSITORY,,}-worker:$GITHUB_SHA" .
+      - name: Publish container
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker push "ghcr.io/${GITHUB_REPOSITORY,,}-worker:$GITHUB_SHA"
+          echo "Worker image: ghcr.io/${GITHUB_REPOSITORY,,}-worker:$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"

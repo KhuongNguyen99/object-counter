@@ -1,0 +1,15 @@
+# Build countwell-backend:runpod-base from Dockerfile with the CUDA 12.8 torch index first.
+ARG WORKER_BASE_IMAGE=countwell-backend:runpod-base
+FROM ${WORKER_BASE_IMAGE}
+
+ARG WORKER_BUILD_REVISION=unknown
+ENV WORKER_BUILD_REVISION=${WORKER_BUILD_REVISION}
+
+USER root
+COPY requirements-runpod.txt /app/requirements-runpod.txt
+RUN pip install -r /app/requirements-runpod.txt
+COPY app/runpod_worker.py /app/app/runpod_worker.py
+USER counter
+
+HEALTHCHECK NONE
+CMD ["python", "-m", "app.runpod_worker"]
