@@ -7,8 +7,10 @@ ENV WORKER_BUILD_REVISION=${WORKER_BUILD_REVISION}
 
 USER root
 COPY requirements-runpod.txt /app/requirements-runpod.txt
-RUN pip install -r /app/requirements-runpod.txt
-COPY app/runpod_worker.py /app/app/runpod_worker.py
+RUN pip install -r /app/requirements-runpod.txt \
+    && chmod -R a+rX /app/models /opt/countgd
+COPY app /app/app
+COPY scripts /app/scripts
 USER counter
 
 HEALTHCHECK NONE

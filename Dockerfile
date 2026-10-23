@@ -42,6 +42,7 @@ COPY --from=model-assets /app/models /app/models
 # Check all cached weights; fetch missing official checkpoints during the build.
 RUN python scripts/download_models.py --model-dir /app/models --models FastSAM-s \
     && HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 python scripts/prepare_countgd.py \
+    && chmod -R a+rX /app/models /opt/countgd \
     && mkdir -p /app/data && chown -R counter:counter /app/data
 USER counter
 EXPOSE 8080

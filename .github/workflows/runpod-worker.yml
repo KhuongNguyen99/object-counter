@@ -2,6 +2,12 @@ name: Publish RunPod worker
 
 on:
   workflow_dispatch:
+    inputs:
+      base_image:
+        description: Optional published worker image digest to reuse as the build base
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -21,14 +27,49 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
           df -h /
+      - name: Select worker base image
+        id: base
+        env:
+          BASE_IMAGE_INPUT: ${{ inputs.base_image }}
+        run: |
+          if [ -n "$BASE_IMAGE_INPUT" ]; then
+            if [[ ! "$BASE_IMAGE_INPUT" =~ ^ghcr\.io/khuongnguyen99/object-counter-worker@sha256:[0-9a-f]{64}$ ]]; then
+              echo "base_image must be a digest for the public Countwell worker image" >&2
+              exit 1
+            fi
+            docker pull "$BASE_IMAGE_INPUT"
+            echo "WORKER_BASE_IMAGE=$BASE_IMAGE_INPUT" >> "$GITHUB_ENV"
+            echo "REUSE_BASE_IMAGE=true" >> "$GITHUB_ENV"
+            echo "reuse=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "WORKER_BASE_IMAGE=countwell-backend:runpod-base" >> "$GITHUB_ENV"
+            echo "REUSE_BASE_IMAGE=false" >> "$GITHUB_ENV"
+            echo "reuse=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Prepare detector checkpoint
+        if: steps.base.outputs.reuse != 'true'
         run: |
           mkdir -p models/countgd
           python scripts/download_models.py --model-dir models --models FastSAM-s
       - name: Build worker with bundled models
         run: |
-          docker build --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128 -t countwell-backend:runpod-base .
-          docker build -f Dockerfile.runpod --build-arg WORKER_BUILD_REVISION="$GITHUB_SHA" --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" -t "ghcr.io/${GITHUB_REPOSITORY,,}-worker:$GITHUB_SHA" .
+          if [ "$REUSE_BASE_IMAGE" != "true" ]; then
+            docker build --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128 -t countwell-backend:runpod-base .
+          fi
+          docker build -f Dockerfile.runpod --build-arg WORKER_BASE_IMAGE="$WORKER_BASE_IMAGE" --build-arg WORKER_BUILD_REVISION="$GITHUB_SHA" --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" -t "ghcr.io/${GITHUB_REPOSITORY,,}-worker:$GITHUB_SHA" .
+      - name: Verify model assets as the worker user
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}-worker:$GITHUB_SHA"
+          docker run --rm --network none --entrypoint python "$image" -c '
+          import os
+          from pathlib import Path
+          from app.models import (FASTSAM_FILENAME, countgd_dir, model_dir,
+                                  validate_checkpoint, validate_countgd_assets)
+          assert os.getuid() == 10001, os.getuid()
+          validate_countgd_assets(countgd_dir())
+          validate_checkpoint(model_dir() / FASTSAM_FILENAME)
+          Path("/opt/countgd/cfg_app.py").read_bytes()
+          '
       - name: Publish container
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
