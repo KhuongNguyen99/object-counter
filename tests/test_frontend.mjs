@@ -6,7 +6,7 @@ import vm from "node:vm";
 // Exercise the actual browser handlers with deferred network responses, without a browser dependency.
 const source = readFileSync(new URL("../frontend/public/app.js", import.meta.url), "utf8").replace(
   /\}\)\(\);\s*$/,
-  "globalThis.testApp = { state, render, addReferences, addTargets, uploadBatch, finishCount, newCount, refreshSession, schedulePoll, stopPolling, useSession, localPhotos, pendingPhotos, referenceReview, apiUrl };})();",
+  "globalThis.testApp = { state, render, addReferences, addTargets, uploadBatch, finishCount, newCount, refreshSession, schedulePoll, stopPolling, useSession, localPhotos, pendingPhotos, referenceReview, apiUrl, refreshComputeStatus };})();",
 );
 const referenceEditorSource = readFileSync(new URL("../frontend/public/reference-review.js", import.meta.url), "utf8");
 const selectionSource = readFileSync(new URL("../frontend/public/reference-selection.js", import.meta.url), "utf8");
@@ -81,7 +81,7 @@ const deferred = () => {
 };
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
-function browser(fetch, savedId = null, modelCatalog = catalog, storage = new Map(), apiBaseUrl = "") {
+function browser(fetch, savedId = null, modelCatalog = catalog, storage = new Map(), apiBaseUrl = "", computeReply = () => response({ enabled: false }), clock = { now: 0 }) {
   const elements = new Map();
   const timers = new Map();
   const revoked = [];
@@ -116,7 +116,9 @@ function browser(fetch, savedId = null, modelCatalog = catalog, storage = new Ma
   const context = {
     document,
     COUNTWELL_CONFIG: { apiBaseUrl },
-    fetch: (path, options) => path.endsWith("/api/models") ? Promise.resolve(response(modelCatalog)) : fetch(path, options),
+    fetch: (path, options) => path.endsWith("/api/models") ? Promise.resolve(response(modelCatalog)) :
+      path.endsWith("/api/compute-status") ? computeReply(path, options) : fetch(path, options),
+    performance: { now: () => clock.now },
     localStorage: {
       getItem(key) { return key === sessionKey && savedId !== null ? savedId : storage.get(key) ?? null; },
       setItem(key, value) { storage.set(key, String(value)); },
@@ -149,6 +151,132 @@ function browser(fetch, savedId = null, modelCatalog = catalog, storage = new Ma
   vm.runInContext(source, context, { filename: "app.js" });
   return { ...context.testApp, get: document.getElementById, timers, revoked, decoded, canvases };
 }
+
+function runTimer(app, delay) {
+  const entry = [...app.timers].find(([, callback]) => callback.retryDelay === delay);
+  assert.ok(entry, `expected a ${delay} ms timer`);
+  app.timers.delete(entry[0]);
+  entry[1]();
+}
+
+test("local status keeps the existing session label without a status poll", async () => {
+  const app = browser(() => { throw new Error("unexpected request"); });
+  await settle();
+  assert.equal(app.get("header-status").textContent, "Ready to count");
+  assert.equal(app.timers.size, 0);
+  app.state.session = session();
+  app.render();
+  assert.equal(app.get("header-status").textContent, "Session active");
+});
+
+test("remote header countdown uses server time and a monotonic clock, then waits for confirmed sleep", async () => {
+  const clock = { now: 0 };
+  const prefix = "https://count.example/api-root";
+  const calls = [];
+  const pending = deferred();
+  const replies = [
+    response({ enabled: true, state: "ready", server_time: "2026-10-23T12:00:00Z", idle_deadline: "2026-10-23T12:10:00Z", idle_timeout_seconds: 600 }),
+    pending.promise,
+    response({ enabled: true, state: "sleeping", server_time: "2026-10-23T12:10:00Z", idle_deadline: null, idle_timeout_seconds: 600 }),
+  ];
+  const app = browser(() => { throw new Error("unexpected request"); }, null, catalog, new Map(), prefix,
+    (path) => { calls.push(path); return replies.shift(); }, clock);
+  await settle();
+  assert.equal(calls[0], `${prefix}/api/compute-status`);
+  assert.equal(app.get("header-status").textContent, "Ready · sleeps in 10:00");
+  clock.now = 1000;
+  runTimer(app, 1000);
+  assert.equal(app.get("header-status").textContent, "Ready · sleeps in 9:59");
+
+  clock.now = 11000;
+  runTimer(app, 10000);
+  assert.equal(calls.length, 2);
+  assert.equal([...app.timers.values()].some((callback) => callback.retryDelay === 10000), false,
+    "no next poll starts while the current request is pending");
+  pending.resolve(response({ enabled: true, state: "ready", server_time: "2026-10-23T12:00:11Z", idle_deadline: "2026-10-23T12:10:00Z", idle_timeout_seconds: 600 }));
+  await settle();
+  assert.equal(app.get("header-status").textContent, "Ready · sleeps in 9:49");
+
+  clock.now = 600000;
+  runTimer(app, 1000);
+  assert.equal(app.get("header-status").textContent, "Stopping…");
+  runTimer(app, 10000);
+  await settle();
+  assert.equal(app.get("header-status").textContent, "Asleep");
+});
+
+test("ready without a known sleep deadline shows Ready and stops the countdown tick", async () => {
+  const clock = { now: 0 };
+  const replies = [
+    response({ enabled: true, state: "ready", server_time: "2026-10-23T12:00:00Z", idle_deadline: null, idle_timeout_seconds: 600 }),
+    response({ enabled: true, state: "ready", server_time: "2026-10-23T12:00:10Z", idle_deadline: "2026-10-23T12:10:00Z", idle_timeout_seconds: 600 }),
+    response({ enabled: true, state: "ready", server_time: "2026-10-23T12:00:20Z", idle_deadline: null, idle_timeout_seconds: 600 }),
+  ];
+  const app = browser(() => { throw new Error("unexpected request"); }, null, catalog, new Map(), "",
+    () => replies.shift(), clock);
+  await settle();
+  assert.equal(app.get("header-status").textContent, "Ready");
+  assert.equal([...app.timers.values()].some((callback) => callback.retryDelay === 1000), false);
+  clock.now = 10000;
+  runTimer(app, 10000);
+  await settle();
+  assert.equal(app.get("header-status").textContent, "Ready · sleeps in 9:50");
+  assert.equal([...app.timers.values()].some((callback) => callback.retryDelay === 1000), true);
+  clock.now = 20000;
+  runTimer(app, 10000);
+  await settle();
+  assert.equal(app.get("header-status").textContent, "Ready");
+  assert.equal([...app.timers.values()].some((callback) => callback.retryDelay === 1000), false);
+});
+
+test("slow status responses keep a ten-second start cadence without overlapping requests", async () => {
+  const clock = { now: 0 };
+  const slow = deferred();
+  const replies = [
+    response({ enabled: true, state: "ready", server_time: "2026-10-23T12:00:00Z", idle_deadline: null, idle_timeout_seconds: 600 }),
+    slow.promise,
+    response({ enabled: true, state: "sleeping", server_time: "2026-10-23T12:00:20Z", idle_deadline: null, idle_timeout_seconds: 600 }),
+  ];
+  let calls = 0;
+  const app = browser(() => { throw new Error("unexpected request"); }, null, catalog, new Map(), "",
+    () => { calls++; return replies.shift(); }, clock);
+  await settle();
+  clock.now = 10000;
+  runTimer(app, 10000);
+  assert.equal(calls, 2);
+  assert.equal([...app.timers.values()].some((callback) => callback.retryDelay === 10000), false);
+  clock.now = 15000;
+  slow.resolve(response({ enabled: true, state: "busy", server_time: "2026-10-23T12:00:15Z", idle_deadline: null, idle_timeout_seconds: 600 }));
+  await settle();
+  assert.equal(app.get("header-status").textContent, "Counting");
+  clock.now = 20000;
+  runTimer(app, 5000);
+  await settle();
+  assert.equal(calls, 3);
+  assert.equal(app.get("header-status").textContent, "Asleep");
+});
+
+test("failed remote status shows uncertainty and retries", async () => {
+  const replies = [
+    response({ enabled: true, state: "starting", server_time: "2026-10-23T12:00:00Z", idle_deadline: null, idle_timeout_seconds: 600 }),
+    () => Promise.reject(new Error("offline")),
+    response({ enabled: true, state: "busy", server_time: "2026-10-23T12:00:20Z", idle_deadline: null, idle_timeout_seconds: 600 }),
+    response({ enabled: true, state: "unavailable", server_time: "2026-10-23T12:00:30Z", idle_deadline: null, idle_timeout_seconds: 600 }),
+  ];
+  const app = browser(() => { throw new Error("unexpected request"); }, null, catalog, new Map(), "",
+    () => { const reply = replies.shift(); return typeof reply === "function" ? reply() : reply; });
+  await settle();
+  assert.equal(app.get("header-status").textContent, "Starting");
+  runTimer(app, 10000);
+  await settle();
+  assert.equal(app.get("header-status").textContent, "Status unavailable");
+  runTimer(app, 10000);
+  await settle();
+  assert.equal(app.get("header-status").textContent, "Counting");
+  runTimer(app, 10000);
+  await settle();
+  assert.equal(app.get("header-status").textContent, "Status unavailable");
+});
 
 test("upload locks thumbnail removal until the submitted batch is accepted", async () => {
   const accepted = deferred();
@@ -265,7 +393,6 @@ test("completion wait retries transient errors with bounded backoff", async () =
   assert.equal(reads, 1);
   assert.equal(app.timers.size, 1);
   const [[timer, retry]] = [...app.timers];
-  assert.equal(timer, 1);
   assert.equal(retry.retryDelay, 2500);
   app.timers.delete(timer);
   retry();

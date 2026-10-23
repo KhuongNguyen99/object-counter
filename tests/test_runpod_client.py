@@ -499,3 +499,69 @@ def test_catalog_requires_endpoint_and_key(monkeypatch):
     monkeypatch.setenv("RUNPOD_API_KEY", "key")
     assert remote.remote_model_catalog()["models"][0]["available"]
     assert remote.remote_model_catalog()["device"] == "remote"
+
+
+class _Activity:
+    def __init__(self):
+        self.started = 0
+        self.finished = []
+
+    def start(self):
+        self.started += 1
+
+    def finish(self, terminal):
+        self.finished.append(terminal)
+
+
+def test_health_is_read_only_and_has_short_timeout():
+    client, opener = _client([{"workers": {"running": 0}, "jobs": {"inQueue": 0}}])
+    assert client.health()["workers"]["running"] == 0
+    assert len(opener.calls) == 1
+    request, timeout = opener.calls[0]
+    assert request.get_method() == "GET"
+    assert request.full_url.endswith("/v2/endpoint-1/health")
+    assert timeout == 5
+
+
+@pytest.mark.parametrize("terminal_status", ["COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"])
+def test_activity_tracks_all_confirmed_terminal_statuses(terminal_status):
+    activity = _Activity()
+    response = {"id": "job-terminal", "status": terminal_status}
+    if terminal_status == "COMPLETED":
+        response["output"] = _count_output()
+    opener = _Opener([response, {}] if terminal_status != "COMPLETED" else [response])
+    client = remote.RunPodClient("top-secret-key", "endpoint-1", opener=opener,
+                                 activity=activity)
+    if terminal_status == "COMPLETED":
+        client.run({"action": "count"})
+    else:
+        with pytest.raises(remote.RunPodError):
+            client.run({"action": "count"})
+    assert activity.started == 1
+    assert activity.finished == [True]
+
+
+def test_activity_does_not_invent_completion_after_network_error():
+    activity = _Activity()
+    client = remote.RunPodClient("top-secret-key", "endpoint-1",
+                                 opener=_Opener([OSError("secret network error")]),
+                                 activity=activity)
+    with pytest.raises(remote.RunPodError):
+        client.run({"action": "count"})
+    assert activity.started == 1
+    assert activity.finished == [False]
+
+
+def test_activity_observer_errors_do_not_fail_inference():
+    class BrokenActivity:
+        def start(self):
+            raise OSError("cannot observe")
+
+        def finish(self, terminal):
+            raise OSError("cannot observe")
+
+    client = remote.RunPodClient("top-secret-key", "endpoint-1",
+                                 opener=_Opener([{"id": "job-ok", "status": "COMPLETED",
+                                                  "output": _count_output()}]),
+                                 activity=BrokenActivity())
+    assert client.run({"action": "count"})["status"] == "COMPLETED"

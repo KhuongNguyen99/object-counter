@@ -16,6 +16,7 @@
 .review-dialog{border:0;border-radius:14px;padding:0;width:min(96vw,1300px);max-width:none;max-height:96vh;box-shadow:0 30px 90px #092d2dcc;background:#fff}.review-dialog::backdrop{background:#0b2324cc}.review-toolbar,.review-footer{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:9px 16px;border-top:1px solid #e9efec}.review-toolbar{font-size:12px;color:#45646b}.review-tools{display:flex;align-items:center;gap:5px;flex-wrap:wrap}.review-tools button{border:1px solid #d5e4e0;border-radius:7px;background:#fff;color:#28605d;padding:6px 9px;font-size:12px;font-weight:700}.review-tools button.active{color:#fff;background:#0b7772;border-color:#0b7772}.review-viewport{height:min(70vh,760px);overflow:auto;background:#263331;position:relative;touch-action:auto}.review-surface{position:relative;line-height:0;margin:auto;user-select:none}.review-surface img{display:block;width:100%;height:100%;max-width:none;pointer-events:none}.review-surface svg{position:absolute;inset:0;width:100%;height:100%;touch-action:none}.review-surface svg rect{fill:#16bda020;stroke:#10c9ad;stroke-width:2.5;vector-effect:non-scaling-stroke}.review-surface svg rect.suggestion{fill:#f59e0b16;stroke:#f59e0b;stroke-dasharray:7 5;cursor:pointer}.review-surface svg rect.draft{stroke-dasharray:6 4;fill:#10c9ad11}.review-surface svg text{fill:#fff;font-weight:800;paint-order:stroke;stroke:#064c46;pointer-events:none}.review-surface.remove svg rect.counted{cursor:pointer}.review-surface.pan svg{cursor:grab}.review-message{padding:0 16px;margin:8px 0;color:#a05330;font-size:12px;min-height:18px}.review-footer{padding:10px 16px}.review-footer .action-button{width:auto;margin:0;min-height:38px;font-size:12px}.review-footer span{margin-right:auto;color:#648084;font-size:12px}.review-viewport:focus-visible{outline:3px solid #1b9f9c;outline-offset:-3px}
 @media(max-width:600px){.review-dialog{width:100vw;max-height:100vh;border-radius:0}.review-viewport{height:65vh}.review-toolbar,.review-footer{padding:9px}.review-tools{width:100%}}
 .site-header { gap: 18px; }
+.header-status.muted { color: #60777b; background: #edf2f1; }
 .page-shell { padding-top: 32px; padding-bottom: 64px; }
 .page-intro { margin-bottom: 24px; }
 .page-intro h1 { font-size: 32px; margin-bottom: 0; }
@@ -59,7 +60,7 @@
 @media (max-width: 380px) {
   .site-header { gap: 10px; }
   .brand { font-size: 20px; }
-  .header-status { font-size: 10px; padding: 6px 8px; }
+  .header-status { font-size: 10px; padding: 6px 8px; white-space: normal; line-height: 1.2; text-align: center; }
   .help-menu > summary { font-size: 12px; padding: 6px; }
 }
 

@@ -51,6 +51,7 @@ Shortcuts work throughout the example editor, including the photo and controls. 
 - Quick count: offer a separate action for simple, separate, evenly spaced objects. Require 1 to 32 marked areas per photo and count suitable detections only inside them, using the same detector as Find objects. Examples and a prior Find objects step are unnecessary. Do not cap results at 10 or 32 objects.
 - Match strength: provide a regular-counting slider from 0.01 to 0.95, initially 0.80. Higher values keep closer matches. Save the choice locally across tab closures. It does not control Quick count or Find objects.
 - Progress: show waiting, counting, complete, and failed states; wait for backend completion notifications and disable conflicting actions during work.
+- Automatic sleep: for remote counting, show a small status in the header and a ten-minute idle countdown after the last job finishes. Check the backend every ten seconds and update the displayed seconds between checks. Counting or finding boxes starts a new idle period when finished; viewing results and status checks do not keep it awake. Show Starting, Counting, Ready, Asleep, or Status unavailable as appropriate. At zero, show Stopping until the backend confirms sleep. Preserve the timer across page and backend restarts; omit the countdown if its start time is unknown.
 - Summary: show total objects, the latest batch count or status, photos counted, and number of batches. Include each batch's date and status, and identify Quick count batches.
 
 ## 4. Review and correct

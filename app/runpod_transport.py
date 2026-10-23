@@ -11,6 +11,7 @@ import time
 
 
 MAX_RESPONSE_BYTES = 20_000_000
+MAX_CONNECTION_IDLE_SECONDS = 60
 
 
 class TransportError(OSError):
@@ -28,6 +29,7 @@ class PersistentHTTPS:
         self._host = host
         self._factory = connection_factory or http.client.HTTPSConnection
         self._connection = None
+        self._last_used = None
         self._lock = threading.Lock()
 
     def close(self):
@@ -36,6 +38,7 @@ class PersistentHTTPS:
 
     def _discard(self):
         connection, self._connection = self._connection, None
+        self._last_used = None
         if connection is not None:
             try:
                 connection.close()
@@ -72,8 +75,10 @@ class PersistentHTTPS:
                 if left <= 0:
                     raise TimeoutError("RunPod request timed out.")
                 connection = self._connection
-                if connection is None or connection.sock is None:
-                    # A prior response may have told http.client to close.
+                if (connection is None or connection.sock is None or
+                        self._last_used is not None and
+                        time.monotonic() - self._last_used >= MAX_CONNECTION_IDLE_SECONDS):
+                    # Refresh idle sockets before sending a new job, never by replaying its POST.
                     self._discard()
                     connection = self._factory(self._host, timeout=left)
                     self._connection = connection
@@ -136,6 +141,8 @@ class PersistentHTTPS:
                 watchdog = None
                 if expired.is_set() or time.monotonic() > deadline:
                     raise TimeoutError("RunPod request timed out.")
+                if self._connection is connection:
+                    self._last_used = time.monotonic()
                 timing["total_ms"] = self._milliseconds(started, time.monotonic())
                 return status, bytes(raw), timing
             except (OSError, TimeoutError, http.client.HTTPException):

@@ -139,6 +139,20 @@ def test_stale_reused_connection_is_discarded_without_replaying_post():
     assert client.last_job["transport_requests"][0]["connection"] == "new"
 
 
+@pytest.mark.parametrize("idle_seconds,connection_count", [(35, 1), (60, 2), (600, 2)])
+def test_new_job_refreshes_long_idle_socket_before_sending(idle_seconds, connection_count, monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(runpod_transport, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    client, connections = _client([_json_response("first"), _json_response("second")])
+    assert client.run({"action": "count"})["id"] == "first"
+    clock[0] += idle_seconds
+    assert client.run({"action": "count"})["id"] == "second"
+    assert len(connections) == connection_count
+    assert sum(len(connection.requests) for connection in connections) == 2
+    assert connections[0].closed == connection_count - 1
+    assert client.last_transport["connection"] == ("new" if connection_count == 2 else "reused")
+
+
 def test_redirect_is_an_error_and_response_limit_discards_connection(monkeypatch):
     client, connections = _client([_Response(302, b'{}'), _Response(200, b"123456")])
     with pytest.raises(remote.RunPodError, match="302"):

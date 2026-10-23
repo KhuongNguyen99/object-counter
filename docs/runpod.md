@@ -4,6 +4,8 @@ The browser and API run locally; CountGD++ counting and FastSAM reference-box su
 
 New counts save detection coordinates and the original photo without generating an annotated JPEG. The browser draws the boxes over its cached photo and creates a full-resolution annotated image when Download is clicked. Restored sessions load the saved original and draw the saved detections. Pending sessions use a revision-based long poll (`GET /api/sessions/{id}?after=<revision>&wait=25`), which returns as soon as the session changes; no half-second browser polling is needed. Run one API worker, as the counting queue and completion notifications are process-local.
 
+App workers stop after ten idle minutes (`workers.min=0`, `workers.idleTimeout=600`) and start again for the next count or automatic box search. RunPod enforces this even if the browser or local API closes. The worker is billed while it stays warm. The header checks `/api/compute-status` every ten seconds and counts down between checks. Status reads do not keep the worker awake. The countdown uses the backend's saved last completed job time; it is an estimate because RunPod does not publish an idle deadline. A new job hides the countdown until it finishes, and the UI confirms sleep from provider status rather than assuming it at zero.
+
 See the [latest warm A5000 frontend test](a5000-pooled-warm-frontend-test.md) for timing, connection reuse, estimated cost, and comparisons with the [previous cloud test](a5000-metadata-warm-frontend-test.md) and [local PC](local-frontend-test.md).
 
 ## Launch
@@ -72,7 +74,7 @@ Reports and the ownership manifest are saved under the output directory:
 
 Both endpoints are deleted on completion by default. `--keep-winner` retains at most one endpoint with verified zero active workers and minimum zero workers, selected by the lowest sum of warm median request times. It does not select by finalized cost. Copy its reported ID into `RUNPOD_ENDPOINT_ID` when ready to use it.
 
-To create a separate app endpoint after the comparison, run `python scripts/runpod_deploy.py create --image <image-at-digest> --gpu "RTX A5000" --manifest test-results/runpod-production/resources.json`. This uses zero minimum workers, one maximum worker, a five-second idle timeout, and standard FlashBoot. The comparison disables FlashBoot to measure full cold starts.
+To create a separate app endpoint after the comparison, run `python scripts/runpod_deploy.py create --image <image-at-digest> --gpu "RTX A5000" --manifest test-results/runpod-production/resources.json`. This uses zero minimum workers, one maximum worker, a ten-minute idle timeout, and standard FlashBoot. The comparison keeps its shorter idle timeout and disables FlashBoot to measure full cold starts.
 
 ## Billing and cleanup
 

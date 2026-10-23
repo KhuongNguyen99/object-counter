@@ -29,7 +29,7 @@ def test_runpod_backend_routes_catalog_suggestions_and_count(tmp_path, monkeypat
     engines = []
 
     class FakeRemoteEngine:
-        def __init__(self):
+        def __init__(self, **kwargs):
             self.count_calls = []
             engines.append(self)
 
@@ -109,3 +109,4 @@ def test_unknown_backend_is_rejected_even_with_injected_dependencies(tmp_path, m
     monkeypatch.setenv("INFERENCE_BACKEND", "other")
     with pytest.raises(ValueError, match="INFERENCE_BACKEND must be local or runpod"):
         create_app(tmp_path, engine_factory=lambda: object(), model_lister=lambda: [])
+

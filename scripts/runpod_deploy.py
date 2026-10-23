@@ -135,8 +135,8 @@ def endpoint_body(name, image, gpu, *, timeout_seconds=300, idle_seconds=30,
                   disk_gb=30, env=None, flashboot="OFF", data_center_ids=None):
     if not image or not isinstance(image, str):
         raise ValueError("A published container image is required.")
-    if not 1 <= timeout_seconds <= 1800 or not 1 <= idle_seconds <= 60 or not 1 <= disk_gb <= 100:
-        raise ValueError("Timeout, idle timeout, or disk size exceeds the supported benchmark limits.")
+    if not 1 <= timeout_seconds <= 1800 or not 1 <= idle_seconds <= 3600 or not 1 <= disk_gb <= 100:
+        raise ValueError("Timeout, idle timeout, or disk size exceeds the supported limits.")
     if flashboot not in {"OFF", "FLASHBOOT"}:
         raise ValueError("FlashBoot must be OFF or FLASHBOOT.")
     body = {"name": name, "image": image, "type": "QUEUE", "disk": disk_gb,
@@ -308,7 +308,7 @@ def main(argv=None):
             owned = OwnedEndpoints(api, args.manifest)
             try:
                 resource = owned.create(args.image, select_gpu(api.catalog(), args.gpu),
-                                        idle_seconds=5, flashboot="FLASHBOOT",
+                                        idle_seconds=600, flashboot="FLASHBOOT",
                                         data_center_ids=args.data_center_ids)
             except BaseException:
                 owned.cleanup()

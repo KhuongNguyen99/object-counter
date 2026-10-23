@@ -139,6 +139,72 @@
     return data;
   }
 
+  const computeStatus = { mode: "checking", state: null, remainingMs: null, observedAt: 0 };
+  let computeStatusTick = null;
+
+  function renderHeaderStatus() {
+    let label;
+    if (computeStatus.mode === "checking") label = "Checking…";
+    else if (computeStatus.mode === "local") {
+      const active = !!state.session;
+      label = state.restoring ? "Restoring count" : !active ? "Ready to count" : state.session.status === "finished" ? "Count finished" : hasPending() ? "Counting photos" : "Session active";
+    } else if (computeStatus.mode === "unavailable" || computeStatus.state === "unavailable") label = "Status unavailable";
+    else if (computeStatus.state === "sleeping") label = "Asleep";
+    else if (computeStatus.state === "starting") label = "Starting";
+    else if (computeStatus.state === "busy") label = "Counting";
+    else if (computeStatus.state === "ready") {
+      if (computeStatus.remainingMs === null) label = "Ready";
+      else {
+        const seconds = Math.ceil((computeStatus.remainingMs - (performance.now() - computeStatus.observedAt)) / 1000);
+        label = !Number.isFinite(seconds) ? "Status unavailable" : seconds <= 0 ? "Stopping…" : `Ready · sleeps in ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+      }
+    } else label = "Status unavailable";
+    $("header-status").textContent = label;
+    $("header-status").classList.toggle("muted", ["Asleep", "Status unavailable", "Stopping…", "Checking…"].includes(label));
+  }
+
+  function tickComputeStatus() {
+    renderHeaderStatus();
+    if (computeStatus.mode === "remote" && computeStatus.state === "ready" && computeStatus.remainingMs !== null && computeStatus.remainingMs > performance.now() - computeStatus.observedAt) {
+      computeStatusTick = setTimeout(tickComputeStatus, 1000);
+    } else computeStatusTick = null;
+  }
+
+  async function refreshComputeStatus() {
+    const started = performance.now();
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 9000);
+    try {
+      const data = await request("/api/compute-status", { signal: controller.signal });
+      if (data.enabled === false) {
+        computeStatus.mode = "local";
+        computeStatus.state = null;
+      } else {
+        if (data.enabled !== true || !["sleeping", "starting", "busy", "ready", "unavailable"].includes(data.state)) throw new Error("Invalid status");
+        computeStatus.mode = "remote";
+        computeStatus.state = data.state;
+        if (data.state === "ready") {
+          computeStatus.remainingMs = null;
+          if (data.idle_deadline !== null) {
+            const remainingMs = Date.parse(data.idle_deadline) - Date.parse(data.server_time);
+            if (!Number.isFinite(remainingMs) || !Number.isFinite(data.idle_timeout_seconds) || remainingMs > data.idle_timeout_seconds * 1000) throw new Error("Invalid countdown");
+            computeStatus.remainingMs = Math.max(0, remainingMs);
+            computeStatus.observedAt = performance.now();
+          }
+        }
+      }
+    } catch {
+      computeStatus.mode = "unavailable";
+    } finally {
+      clearTimeout(timeout);
+      if (computeStatusTick) clearTimeout(computeStatusTick);
+      computeStatusTick = null;
+      renderHeaderStatus();
+      if (computeStatus.mode === "remote" && computeStatus.state === "ready" && computeStatus.remainingMs !== null) tickComputeStatus();
+      if (computeStatus.mode !== "local") setTimeout(refreshComputeStatus, Math.max(0, 10000 - (performance.now() - started)));
+    }
+  }
+
   function renderModels(defaultId) {
     const select = $("model-select");
     select.replaceChildren();
@@ -495,7 +561,7 @@
     $("page-intro").hidden = active || state.restoring;
     $("setup-view").hidden = active || state.restoring;
     $("session-view").hidden = !active || state.restoring;
-    $("header-status").textContent = state.restoring ? "Restoring count" : !active ? "Ready to count" : state.session.status === "finished" ? "Count finished" : hasPending() ? "Counting photos" : "Session active";
+    renderHeaderStatus();
     if (active) renderSession();
     renderReferences();
     renderTargets();
@@ -1194,6 +1260,7 @@
   });
   render();
   loadModels();
+  refreshComputeStatus();
   if (savedId) {
     message("Restoring your previous count…", true);
     request(`/api/sessions/${encodeURIComponent(savedId)}`).then((session) => {

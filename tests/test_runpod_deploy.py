@@ -261,9 +261,20 @@ def test_missing_or_changed_cuda_floor_rejects_created_endpoint(tmp_path, report
 
 def test_production_flashboot_does_not_enable_always_on_workers():
     body = endpoint_body("production", "worker:v1", select_gpu(CATALOG, "L4"),
-                         idle_seconds=5, flashboot="FLASHBOOT")
+                         idle_seconds=600, flashboot="FLASHBOOT")
     assert body["flashboot"] == "FLASHBOOT"
-    assert body["workers"] == {"min": 0, "max": 1, "idleTimeout": 5}
+    assert body["workers"] == {"min": 0, "max": 1, "idleTimeout": 600}
     with pytest.raises(ValueError, match="FlashBoot"):
         endpoint_body("production", "worker:v1", select_gpu(CATALOG, "L4"),
                       flashboot="PRIORITY_FLASHBOOT")
+
+
+def test_production_cli_sets_ten_minute_idle_timeout(tmp_path, monkeypatch):
+    api = FakeApi()
+    monkeypatch.setattr(runpod_deploy, "RunPodApi", lambda key: api)
+    monkeypatch.setattr(runpod_deploy, "load_api_key", lambda path: "not-a-real-key")
+    assert runpod_deploy.main(["create", "--image", "worker:v1", "--manifest",
+                               str(tmp_path / "resources.json")]) == 0
+    assert api.live["endpoint-1"]["workers"] == {"min": 0, "max": 1, "idleTimeout": 600}
+    with pytest.raises(ValueError, match="idle timeout"):
+        endpoint_body("bad", "worker:v1", select_gpu(CATALOG, "L4"), idle_seconds=3601)

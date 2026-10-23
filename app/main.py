@@ -303,6 +303,11 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None, frontend_o
 
     detect_device = model_lister is None
     remote = backend == "runpod"
+    if remote:
+        from app.compute_status import ComputeStatus
+        compute_status = ComputeStatus(data_dir, os.environ.get("RUNPOD_ENDPOINT_ID", ""))
+    else:
+        compute_status = None
     if model_lister is None:
         if remote:
             from app.runpod_client import remote_model_catalog
@@ -316,7 +321,8 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None, frontend_o
     if engine_factory is None:
         if remote:
             from app.runpod_client import RunPodInferenceEngine
-            engine_factory = RunPodInferenceEngine
+            def engine_factory():
+                return RunPodInferenceEngine(activity=compute_status)
         else:
             def engine_factory():
                 from app.inference import InferenceEngine
@@ -328,6 +334,8 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None, frontend_o
         executor.shutdown(wait=True)
         if engine is not None and hasattr(engine, "close"):
             engine.close()
+        if compute_status is not None:
+            compute_status.close()
 
     app = _CORSFastAPI(title="Object Counting", lifespan=lifespan,
                        allowed_origins=allowed_origins)
@@ -457,10 +465,17 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None, frontend_o
         finally:
             shutil.rmtree(output_dir, ignore_errors=True)
             slots.release()
+            if compute_status is not None:
+                compute_status.finish()
 
     @app.get("/api/health")
     def health():
         return {"status": "ok"}
+
+    @app.get("/api/compute-status")
+    def compute(response: Response):
+        response.headers["Cache-Control"] = "no-store"
+        return compute_status.snapshot() if compute_status is not None else {"enabled": False}
 
     @app.get("/reports/reliability.html", include_in_schema=False)
     def reliability_report():
@@ -495,11 +510,17 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None, frontend_o
                     return _validate_reference_proposal(engine.suggest_reference_boxes(str(image_path), label), width, height)
             finally:
                 slots.release()
+                if compute_status is not None:
+                    compute_status.finish()
 
+        if compute_status is not None:
+            compute_status.start()
         try:
             future = executor.submit(run_reference)
         except Exception:
             slots.release()
+            if compute_status is not None:
+                compute_status.finish()
             logger.exception("Could not schedule reference box detection")
             raise HTTPException(500, "Could not schedule automatic box suggestions")
         try:
@@ -668,9 +689,13 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None, frontend_o
                               "duplicate": "Image already exists in this session"}[error]
                     raise HTTPException(status, detail)
                 notify_session(session_id)
+                if compute_status is not None:
+                    compute_status.start()
                 try:
                     executor.submit(run_batch, session_id, batch_id, items, per_image, count_mode)
                 except Exception:
+                    if compute_status is not None:
+                        compute_status.finish()
                     store.set_batch_status(batch_id, "failed", "Could not schedule counting. Please retry.")
                     notify_session(session_id)
                     raise

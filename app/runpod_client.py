@@ -101,7 +101,7 @@ def _safe_metrics(value, *, api_key=""):
 class RunPodClient:
     """RunPod client with no automatic submission or redirect retries."""
 
-    def __init__(self, api_key=None, endpoint_id=None, timeout_seconds=None, *, opener=None):
+    def __init__(self, api_key=None, endpoint_id=None, timeout_seconds=None, *, opener=None, activity=None):
         self.api_key = api_key if api_key is not None else os.environ.get("RUNPOD_API_KEY", "")
         self.endpoint_id = endpoint_id if endpoint_id is not None else os.environ.get("RUNPOD_ENDPOINT_ID", "")
         raw_timeout = (timeout_seconds if timeout_seconds is not None
@@ -126,11 +126,18 @@ class RunPodClient:
         self.last_transport = None
         self._run_transport_timings = None
         self.last_job = None
+        self.activity = activity
+        self._run_terminal = False
 
     @_serialized
     def close(self):
         if self._transport is not None:
             self._transport.close()
+
+    @_serialized
+    def health(self):
+        """Read endpoint worker and queue counts without submitting a job."""
+        return self._request("GET", "health", timeout=5)
 
     @staticmethod
     def _encode(payload):
@@ -244,11 +251,13 @@ class RunPodClient:
                     raise RunPodError("RunPod returned an unexpected job ID.")
                 status = data.get("status")
                 if status == "COMPLETED":
+                    self._run_terminal = True
                     if time.monotonic() >= deadline:
                         raise RunPodError("RunPod job timed out; cancellation was requested.")
                     completed = True
                     return data
                 if status in ("FAILED", "CANCELLED", "TIMED_OUT"):
+                    self._run_terminal = True
                     raise RunPodError(f"RunPod job ended with status {status}.")
                 if status not in ("IN_QUEUE", "IN_PROGRESS"):
                     raise RunPodError("RunPod returned an unknown job status.")
@@ -266,6 +275,22 @@ class RunPodClient:
     @_serialized
     def run(self, job_input):
         """Wait on the original request, then poll the same job if still pending."""
+        self._run_terminal = False
+        if self.activity is not None:
+            try:
+                self.activity.start()
+            except Exception:
+                pass  # Observability cannot prevent an inference request.
+        try:
+            return self._run(job_input)
+        finally:
+            if self.activity is not None:
+                try:
+                    self.activity.finish(self._run_terminal)
+                except Exception:
+                    pass  # Observability cannot change the inference result.
+
+    def _run(self, job_input):
         started = time.monotonic()
         self.last_job = None
         if not isinstance(job_input, dict):
@@ -297,6 +322,7 @@ class RunPodClient:
             self._run_transport_timings = None
             raise RunPodError("RunPod did not return a valid job ID.")
         self.last_job = {"job_id": job_id}
+        self._run_terminal = response.get("status") in ("COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT")
         pending = response.get("status") in ("IN_QUEUE", "IN_PROGRESS")
         try:
             if pending:
@@ -330,8 +356,8 @@ class RunPodClient:
 class RunPodInferenceEngine:
     """CountGD++ per-image engine matching the application's inference API."""
 
-    def __init__(self, api_key=None, endpoint_id=None, timeout_seconds=None, *, client=None):
-        self.client = client if client is not None else RunPodClient(api_key, endpoint_id, timeout_seconds)
+    def __init__(self, api_key=None, endpoint_id=None, timeout_seconds=None, *, client=None, activity=None):
+        self.client = client if client is not None else RunPodClient(api_key, endpoint_id, timeout_seconds, activity=activity)
         self.last_jobs = []
 
     def close(self):

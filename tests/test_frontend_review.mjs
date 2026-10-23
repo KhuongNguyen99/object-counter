@@ -89,11 +89,12 @@ function browser(fetch, confirm = () => true, apiBaseUrl = "") {
   const context = {
     document,
     COUNTWELL_CONFIG: { apiBaseUrl },
-    fetch: (path, options) => path.endsWith("/api/models") ? Promise.resolve(response({
+    fetch: (path, options) => path.endsWith("/api/compute-status") ? Promise.resolve(response({ enabled: false })) : path.endsWith("/api/models") ? Promise.resolve(response({
       models: [{ id: "crosscheck-countgd-yoloe26x", name: "CountGD++ + YOLOE", available: true }],
       default_model: "crosscheck-countgd-yoloe26x", device: "cpu",
     })) : fetch(path, options),
     localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+    performance: { now: () => 0 },
     URL: BrowserURL,
     AbortController,
     Option: class extends Element { constructor(label, value) { super("option"); this.textContent = label; this.value = value; } },
