@@ -110,7 +110,7 @@ class FakeEngine:
         }
 
     def count(self, model_id, references, image_paths, output_dir, confidence, label="",
-              reference_mode="shared"):
+              reference_mode="shared", annotate=True):
         self.calls.append((model_id, references, image_paths, confidence))
         self.reference_modes.append(reference_mode)
         self.labels.append(label)
@@ -121,11 +121,13 @@ class FakeEngine:
         for i, path in enumerate(image_paths):
             annotated = f"{output_dir}/annotation-{i}.png"
             with Image.open(path) as image:
-                image.save(annotated)
-            detections = ([{"index": 1, "box": [1, 1, 8, 8], "confidence": .9}]
+                width, height = image.size
+                if annotate:
+                    image.save(annotated)
+            detections = ([{"index": 1, "box": [1, 1, min(8, width), min(8, height)], "confidence": .9}]
                           if self.result_count else [])
             result = {"count": self.result_count, "detections": detections,
-                      "annotated_path": annotated, "width": 16, "height": 12,
+                      "annotated_path": annotated if annotate else None, "width": width, "height": height,
                       "elapsed_ms": 2.5, "warning": self.warning}
             if self.processing is not None:
                 result["processing"] = self.processing

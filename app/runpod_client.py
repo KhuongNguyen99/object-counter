@@ -5,16 +5,19 @@ worker owns inference and this module validates its result and draws locally.
 """
 
 import base64
+from functools import wraps
 import json
 import math
 import os
 from pathlib import Path
 import re
+import threading
 import time
 from urllib import error, request
 from uuid import uuid4
 
 from .models import COUNTGD_MODEL_ID, FASTSAM_MODEL_ID
+from .runpod_transport import PersistentHTTPS, TransportError
 
 
 # RunPod's documented maximum for the asynchronous /run request body.
@@ -42,6 +45,15 @@ class _NoRedirect(request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         # Never forward the bearer credential to a redirect target.
         return None
+
+
+def _serialized(method):
+    """Keep one client's job state and connection in request order."""
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapped
 
 
 def _number(value, *, minimum=0, maximum=None):
@@ -107,8 +119,18 @@ class RunPodClient:
         if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
             raise ValueError("RUNPOD_TIMEOUT_SECONDS must be a positive number.")
         self._base = f"https://api.runpod.ai/v2/{self.endpoint_id}"
-        self._opener = opener if opener is not None else request.build_opener(_NoRedirect())
+        # Injected urllib openers retain the existing test/integration seam.
+        self._opener = opener
+        self._transport = PersistentHTTPS() if opener is None else None
+        self._lock = threading.RLock()
+        self.last_transport = None
+        self._run_transport_timings = None
         self.last_job = None
+
+    @_serialized
+    def close(self):
+        if self._transport is not None:
+            self._transport.close()
 
     @staticmethod
     def _encode(payload):
@@ -131,14 +153,34 @@ class RunPodClient:
         headers = {"Authorization": f"Bearer {self.api_key}", "Accept": "application/json"}
         if body is not None:
             headers["Content-Type"] = "application/json"
-        req = request.Request(url, data=body, headers=headers, method=method)
+        self.last_transport = None
         try:
-            with self._opener.open(req, timeout=timeout) as response:
-                raw = response.read(MAX_RESPONSE_BYTES + 1)
+            if self._transport is not None:
+                status, raw, timing = self._transport.request(
+                    method, f"/v2/{self.endpoint_id}/{suffix}", headers, body, timeout=timeout,
+                    max_response_bytes=MAX_RESPONSE_BYTES)
+                self.last_transport = {"request": suffix.split("/", 1)[0].split("?", 1)[0],
+                                       **timing}
+                if self._run_transport_timings is not None:
+                    self._run_transport_timings.append(dict(self.last_transport))
+                if not 200 <= status < 300:
+                    failure = (_TransientRunPodError if status in _TRANSIENT_HTTP_CODES
+                               else RunPodError)
+                    raise failure(f"RunPod request failed (HTTP {status}).")
+            else:
+                req = request.Request(url, data=body, headers=headers, method=method)
+                with self._opener.open(req, timeout=timeout) as response:
+                    raw = response.read(MAX_RESPONSE_BYTES + 1)
         except error.HTTPError as exc:
             code = exc.code if type(exc.code) is int else "unknown"
             failure = _TransientRunPodError if code in _TRANSIENT_HTTP_CODES else RunPodError
             raise failure(f"RunPod request failed (HTTP {code}).") from None
+        except TransportError as exc:
+            self.last_transport = {"request": suffix.split("/", 1)[0].split("?", 1)[0],
+                                   **exc.timing}
+            if self._run_transport_timings is not None:
+                self._run_transport_timings.append(dict(self.last_transport))
+            raise _TransientRunPodError("RunPod request failed due to a network error.") from None
         except (error.URLError, OSError, TimeoutError):
             raise _TransientRunPodError("RunPod request failed due to a network error.") from None
         if len(raw) > MAX_RESPONSE_BYTES:
@@ -151,6 +193,7 @@ class RunPodClient:
             raise RunPodError("RunPod returned an invalid response.")
         return result
 
+    @_serialized
     def submit(self, job_input):
         """Submit once and return the job ID. A network ambiguity is never retried."""
         if not isinstance(job_input, dict):
@@ -164,11 +207,13 @@ class RunPodClient:
             raise RunPodError("RunPod did not accept the job.")
         return job_id
 
+    @_serialized
     def cancel(self, job_id):
         if not isinstance(job_id, str) or not _ID.fullmatch(job_id):
             raise ValueError("Invalid RunPod job ID.")
         self._request("POST", f"cancel/{job_id}", timeout=5)
 
+    @_serialized
     def wait(self, job_id, *, timeout_seconds=None):
         if not isinstance(job_id, str) or not _ID.fullmatch(job_id):
             raise ValueError("Invalid RunPod job ID.")
@@ -218,9 +263,11 @@ class RunPodClient:
                 except BaseException:
                     pass
 
+    @_serialized
     def run(self, job_input):
         """Wait on the original request, then poll the same job if still pending."""
         started = time.monotonic()
+        self.last_job = None
         if not isinstance(job_input, dict):
             raise ValueError("RunPod input must be an object.")
         body_size = len(self._encode({"input": job_input}))
@@ -234,11 +281,17 @@ class RunPodClient:
             raise ValueError("RUNPOD_TIMEOUT_SECONDS must allow at least 1 second for /runsync.")
         # Leave transport time to receive a pending job ID before the deadline.
         wait_ms = max(1000, int(min(300, remaining * .95) * 1000))
-        response = self._request("POST", f"runsync?wait={wait_ms}", {"input": job_input},
-                                 timeout=min(305, remaining),
-                                 max_payload_bytes=MAX_SYNC_PAYLOAD_BYTES)
+        self._run_transport_timings = []
+        try:
+            response = self._request("POST", f"runsync?wait={wait_ms}", {"input": job_input},
+                                     timeout=min(305, remaining),
+                                     max_payload_bytes=MAX_SYNC_PAYLOAD_BYTES)
+        except BaseException:
+            self._run_transport_timings = None
+            raise
         job_id = response.get("id")
         if not isinstance(job_id, str) or not _ID.fullmatch(job_id):
+            self._run_transport_timings = None
             raise RunPodError("RunPod did not return a valid job ID.")
         self.last_job = {"job_id": job_id}
         pending = response.get("status") in ("IN_QUEUE", "IN_PROGRESS")
@@ -259,6 +312,9 @@ class RunPodClient:
             raise
         finally:
             self.last_job["wall_ms"] = round((time.monotonic() - started) * 1000, 2)
+            if self._run_transport_timings:
+                self.last_job["transport_requests"] = list(self._run_transport_timings)
+            self._run_transport_timings = None
         for key in ("delayTime", "executionTime"):
             if _number(response.get(key)):
                 self.last_job[key] = response[key]
@@ -276,32 +332,28 @@ class RunPodInferenceEngine:
         self.last_jobs = []
 
     def close(self):
-        pass
+        self.client.close()
 
     def _infer(self, action, image_path, *, boxes=None, confidence=None, label=""):
+        raw = Path(image_path).read_bytes()
+        payload = {"action": action, "image_base64": base64.b64encode(raw).decode("ascii"),
+                   "label": label}
+        if action == "count":
+            payload.update(boxes=boxes, confidence=confidence)
+        response = self.client.run(payload)
+        if isinstance(self.client.last_job, dict):
+            self.last_jobs.append(dict(self.client.last_job))
+        output = response.get("output")
+        if not isinstance(output, dict) or not isinstance(output.get("result"), dict):
+            raise RunPodError("RunPod worker returned an invalid result.")
+        return output["result"]
+
+    def suggest_reference_boxes(self, image_path: str, label: str = "") -> dict:
         from .inference import _read_image
 
         image = _read_image(image_path)
         try:
-            raw = Path(image_path).read_bytes()
-            payload = {"action": action, "image_base64": base64.b64encode(raw).decode("ascii"),
-                       "label": label}
-            if action == "count":
-                payload.update(boxes=boxes, confidence=confidence)
-            response = self.client.run(payload)
-            if isinstance(self.client.last_job, dict):
-                self.last_jobs.append(dict(self.client.last_job))
-            output = response.get("output")
-            if not isinstance(output, dict) or not isinstance(output.get("result"), dict):
-                raise RunPodError("RunPod worker returned an invalid result.")
-            return image, output["result"]
-        except BaseException:
-            image.close()
-            raise
-
-    def suggest_reference_boxes(self, image_path: str, label: str = "") -> dict:
-        image, result = self._infer("suggest", image_path, label=label)
-        try:
+            result = self._infer("suggest", image_path, label=label)
             boxes = result.get("boxes")
             warning = result.get("warning")
             if (type(result.get("width")) is not int or result["width"] != image.width or
@@ -319,7 +371,8 @@ class RunPodInferenceEngine:
 
     def count(self, model_id: str, references: list[dict], image_paths: list[str],
               output_dir: str, confidence: float = .25, label: str = "", *,
-              reference_strategy: str = "mean", reference_mode: str = "per_image") -> list[dict]:
+              reference_strategy: str = "mean", reference_mode: str = "per_image",
+              annotate: bool = True) -> list[dict]:
         from .inference import _read_image
 
         if model_id != COUNTGD_MODEL_ID or reference_mode != "per_image" or reference_strategy != "mean":
@@ -328,8 +381,11 @@ class RunPodInferenceEngine:
             raise ValueError("Confidence must be between 0 and 1.")
         if not isinstance(label, str):
             raise ValueError("Label must be text.")
+        if not isinstance(annotate, bool):
+            raise ValueError("Annotate must be a boolean.")
         if not image_paths or not isinstance(references, list) or len(references) != len(image_paths):
             raise ValueError("CountGD++ needs one set of reference boxes for each image to count.")
+        sizes = []
         for reference, image_path in zip(references, image_paths, strict=True):
             if (not isinstance(reference, dict) or not isinstance(reference.get("path"), str) or
                     not Path(reference["path"]).is_absolute() or
@@ -342,30 +398,27 @@ class RunPodInferenceEngine:
                         any(not _box(box, *image.size) for box in boxes) or
                         len({tuple(box) for box in boxes}) != len(boxes)):
                     raise ValueError("Each CountGD++ target image needs 1–32 distinct in-bounds boxes.")
+                sizes.append(image.size)
             finally:
                 image.close()
         directory = Path(output_dir).resolve()
         directory.mkdir(parents=True, exist_ok=True)
         self.last_jobs = []
         outputs = []
-        for reference, image_path in zip(references, image_paths, strict=True):
-            image, result = self._infer("count", image_path, boxes=reference["boxes"],
-                                        confidence=confidence, label=label)
-            try:
-                outputs.append(self._count_result(result, image, directory))
-            finally:
-                image.close()
+        for reference, image_path, size in zip(references, image_paths, sizes, strict=True):
+            result = self._infer("count", image_path, boxes=reference["boxes"],
+                                 confidence=confidence, label=label)
+            outputs.append(self._count_result(result, size, directory,
+                                              image_path if annotate else None))
         return outputs
 
     @staticmethod
-    def _count_result(result, image, directory):
-        from .inference import _draw_detections
-
+    def _count_result(result, size, directory, image_path):
         count, detections = result.get("count"), result.get("detections")
         warning = result.get("warning")
         if ("annotated_path" in result or type(result.get("width")) is not int or
-                result["width"] != image.width or type(result.get("height")) is not int or
-                result["height"] != image.height or type(count) is not int or
+                result["width"] != size[0] or type(result.get("height")) is not int or
+                result["height"] != size[1] or type(count) is not int or
                 not 0 <= count <= MAX_DETECTIONS or not isinstance(detections, list) or
                 len(detections) != count or not _number(result.get("elapsed_ms")) or
                 warning not in (_WARNING, _WARNING + _LIMIT_WARNING)):
@@ -374,7 +427,7 @@ class RunPodInferenceEngine:
         for index, detection in enumerate(detections, start=1):
             if (not isinstance(detection, dict) or detection.get("index") != index or
                     type(detection.get("index")) is not int or
-                    not _box(detection.get("box"), *image.size) or
+                    not _box(detection.get("box"), *size) or
                     not _number(detection.get("confidence"), maximum=1)):
                 raise RunPodError("RunPod worker returned an invalid detection.")
             checked.append({"index": index, "box": detection["box"],
@@ -387,11 +440,21 @@ class RunPodInferenceEngine:
                     any(type(processing[key]) is not int or not low <= processing[key] <= high
                         for key, (low, high) in limits.items())):
                 raise RunPodError("RunPod worker returned invalid processing metadata.")
-        destination = directory / f"{uuid4().hex}.jpg"
-        _draw_detections(image, checked, destination)
-        output = {"count": count, "detections": checked, "annotated_path": str(destination),
-                  "width": image.width, "height": image.height,
+        output = {"count": count, "detections": checked,
+                  "width": size[0], "height": size[1],
                   "elapsed_ms": result["elapsed_ms"], "warning": warning}
+        if image_path is not None:
+            from .inference import _draw_detections, _read_image
+
+            image = _read_image(image_path)
+            try:
+                if image.size != size:
+                    raise RunPodError("Image dimensions changed during remote inference.")
+                destination = directory / f"{uuid4().hex}.jpg"
+                _draw_detections(image, checked, destination)
+                output["annotated_path"] = str(destination)
+            finally:
+                image.close()
         if processing is not None:
             output["processing"] = dict(processing)
         return output

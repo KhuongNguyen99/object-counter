@@ -354,6 +354,48 @@ def test_adapter_count_preserves_image_bytes_and_draws_locally(tmp_path):
     assert engine.last_jobs[0]["worker_metrics"]["gpu_name"] == "NVIDIA A100"
 
 
+def test_adapter_count_without_annotation_decodes_once_and_returns_metadata(tmp_path, monkeypatch):
+    from app import inference
+
+    source = _image(tmp_path / "input.png")
+    client, opener = _client([{"id": "job-13", "status": "COMPLETED",
+                               "output": _count_output()}])
+    engine = remote.RunPodInferenceEngine(client=client)
+    original_read = inference._read_image
+    reads = []
+
+    def read_image(path):
+        reads.append(path)
+        return original_read(path)
+
+    monkeypatch.setattr(inference, "_read_image", read_image)
+    monkeypatch.setattr(inference, "_draw_detections",
+                        lambda *args: pytest.fail("annotation was drawn"))
+    result = engine.count("countgd-plusplus", [{"path": source, "boxes": [[2, 3, 12, 15]]}],
+                          [source], str(tmp_path / "out"), reference_mode="per_image",
+                          annotate=False)[0]
+    assert reads == [source]
+    assert result["count"] == 1 and result["detections"][0]["box"] == [1, 2, 11, 12]
+    assert result["width"] == 40 and result["height"] == 30
+    assert "annotated_path" not in result
+    assert not list((tmp_path / "out").glob("*.jpg"))
+    assert json.loads(opener.calls[0][0].data)["input"]["image_base64"] == (
+        base64.b64encode(Path(source).read_bytes()).decode())
+
+
+def test_adapter_validates_all_references_before_submitting(tmp_path):
+    first = _image(tmp_path / "first.png")
+    second = _image(tmp_path / "second.png")
+    client, opener = _client([])
+    engine = remote.RunPodInferenceEngine(client=client)
+    with pytest.raises(ValueError, match="in-bounds"):
+        engine.count("countgd-plusplus", [
+            {"path": first, "boxes": [[2, 3, 12, 15]]},
+            {"path": second, "boxes": [[2, 3, 41, 15]]},
+        ], [first, second], str(tmp_path / "out"), annotate=False)
+    assert not opener.calls
+
+
 @pytest.mark.parametrize("mutation", [
     lambda result: result.update(width=41),
     lambda result: result.update(count=2),

@@ -72,6 +72,25 @@ def test_result_keeps_one_detection_per_box_and_forwards_label(tmp_path):
     assert "Experimental model" in output["warning"]
 
 
+def test_single_tile_clips_edge_detections_and_drops_zero_area(tmp_path):
+    source = tmp_path / "image.png"
+    Image.new("RGB", (100, 100), "gray").save(source)
+    engine = CountGDEngine.__new__(CountGDEngine)
+    engine._predict = lambda *args: (
+        np.array([[.02, .5, .2, .2], [.98, .5, .2, .2], [1., .5, 1e-320, .2]]),
+        np.array([.9, .8, .7]),
+    )
+    result = engine.count([{"path": str(source), "boxes": [[10, 10, 40, 40]]}],
+                          [str(source)], str(tmp_path / "out"), annotate=False)[0]
+    assert result["count"] == 2
+    np.testing.assert_allclose([detection["box"] for detection in result["detections"]],
+                               [[0., 40., 12., 60.], [88., 40., 100., 60.]])
+    assert result["detections"][0]["box"][0] == 0
+    assert result["detections"][1]["box"][2] == 100
+    assert [detection["index"] for detection in result["detections"]] == [1, 2]
+    assert "annotated_path" not in result
+
+
 def test_per_image_count_skips_annotation_without_changing_detections(tmp_path, monkeypatch):
     from app import inference
 
@@ -90,7 +109,7 @@ def test_per_image_count_skips_annotation_without_changing_detections(tmp_path, 
     remote_dir = tmp_path / "remote"
     remote = engine.count("countgd-plusplus", [reference], [str(source)], str(remote_dir),
                           reference_mode="per_image", annotate=False)[0]
-    assert remote["annotated_path"] is None
+    assert "annotated_path" not in remote
     assert list(remote_dir.iterdir()) == []
     for field in ("count", "detections", "width", "height", "warning"):
         assert remote[field] == local[field]

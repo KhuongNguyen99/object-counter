@@ -8,6 +8,7 @@ const source = readFileSync(new URL("../frontend/public/app.js", import.meta.url
   "globalThis.testApp = { state, render, openReview, saveReview, finishCount, reloadReview };})();",
 );
 const referenceEditorSource = readFileSync(new URL("../frontend/public/reference-review.js", import.meta.url), "utf8");
+const annotationSource = readFileSync(new URL("../frontend/public/result-annotations.js", import.meta.url), "utf8");
 
 class Element {
   constructor(tag = "div") {
@@ -94,11 +95,13 @@ function browser(fetch, confirm = () => true, apiBaseUrl = "") {
     })) : fetch(path, options),
     localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
     URL: BrowserURL,
+    AbortController,
     Option: class extends Element { constructor(label, value) { super("option"); this.textContent = label; this.value = value; } },
     setTimeout: () => 1, clearTimeout() {}, window: { scrollTo() {}, confirm },
   };
   vm.createContext(context);
   vm.runInContext(referenceEditorSource, context, { filename: "reference-review.js" });
+  vm.runInContext(annotationSource, context, { filename: "result-annotations.js" });
   vm.runInContext(source, context, { filename: "app.js" });
   return { ...context.testApp, get: document.getElementById };
 }

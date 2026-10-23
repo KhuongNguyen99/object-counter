@@ -1,8 +1,10 @@
 # RunPod Serverless
 
-The browser and API run locally; CountGD++ counting and FastSAM reference-box suggestions run on a RunPod queue endpoint. Counting uses reference boxes drawn on each target image. Original image bytes are sent to the worker; annotations are drawn locally after the response. The API waits for the result through `/runsync`, falling back to status polling when a job outlasts that wait. The browser checks pending counts every half second.
+The browser and API run locally; CountGD++ counting and FastSAM reference-box suggestions run on a RunPod queue endpoint. Counting uses reference boxes drawn on each target image. Original image bytes are sent to the worker. The API waits for the result through `/runsync`, falling back to status polling when a job outlasts that wait.
 
-See the [optimized warm A5000 frontend test](a5000-optimized-warm-frontend-test.md) for measured time and estimated cost, and the [local PC comparison](local-frontend-test.md).
+New counts save detection coordinates and the original photo without generating an annotated JPEG. The browser draws the boxes over its cached photo and creates a full-resolution annotated image when Download is clicked. Restored sessions load the saved original and draw the saved detections. Pending sessions use a revision-based long poll (`GET /api/sessions/{id}?after=<revision>&wait=25`), which returns as soon as the session changes; no half-second browser polling is needed. Run one API worker, as the counting queue and completion notifications are process-local.
+
+See the [latest warm A5000 frontend test](a5000-metadata-warm-frontend-test.md) for timing, estimated cost, and comparisons with the [previous cloud test](a5000-optimized-warm-frontend-test.md) and [local PC](local-frontend-test.md).
 
 ## Launch
 
@@ -93,6 +95,10 @@ python scripts/runpod_deploy.py cleanup --manifest test-results/runpod-benchmark
 This also deletes any retained winner. Keep the manifest until cleanup completes. The tool verifies endpoint name and image before deleting; changed resources require review. An uncertain create is reconciled by its unique saved name rather than submitted again.
 
 ## Image size limits
+
+The app reuses one HTTPS connection for queued requests and records connection, upload, response-wait, and download timings in its internal job diagnostics. It never automatically resubmits a failed count request. Set `RUNPOD_TRACE_TIMING=1` on a worker to log the SDK's result handoff and upload/acknowledgment timings without logging photos or credentials.
+
+To restrict a newly created endpoint to a location, add `--data-center US-IL-1` to the deployment command (repeat the option for multiple allowed locations). Capacity varies; the worker's actual location must be checked while it is running.
 
 The app sends up to 20 MB of serialized JSON through `/runsync`. Base64 adds roughly one third to image size, so an original image near **15 MB** can exceed the limit once JSON and boxes are included. Oversized images are rejected without recompression; larger originals require an object-storage transfer implementation. The standalone GPU-comparison benchmark retains a stricter 10 MB serialized limit, roughly **7.5 MB** of original image bytes.
 

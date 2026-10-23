@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from app.main import create_app
-from app.quick_count import _filter_sizes
+from app.quick_count import _filter_sizes, count_marked_areas
 from app.storage import Store
 
 
@@ -96,13 +96,35 @@ def test_quick_counts_only_native_pixel_crops_and_offsets_boxes_without_referenc
         assert [d["index"] for d in item["detections"]] == [1, 2]
         assert all(d["confidence"] is None for d in item["detections"])
         assert item["elapsed_ms"] >= 0
-        assert client.get(item["annotated_url"]).status_code == 200
+        assert item["annotated_url"] is None
+        assert item["model_annotated_url"] is None
+        assert client.get(item["original_url"]).status_code == 200
+        assert len(list((tmp_path / sid / "files").glob("*.jpg"))) == 1
     assert engine.count_calls == 0
     assert [entry[0] for entry in engine.crops] == [(16, 16), (16, 16)]
     assert [entry[2] for entry in engine.crops] == ["buttons", "buttons"]
     assert engine.crops[0][1][0] > 240 and engine.crops[0][1][2] < 10
     assert engine.crops[1][1][2] > 240 and engine.crops[1][1][0] < 10
     assert all(not Path(path).exists() for path in engine.crop_paths)
+
+
+def test_quick_count_without_annotation_returns_detections_only(tmp_path, monkeypatch):
+    from app import quick_count
+
+    image_path = tmp_path / "photo.png"
+    image_path.write_bytes(photo())
+    engine = QuickEngine(groups=[[[1, 1, 5, 5]]])
+    monkeypatch.setattr(quick_count, "_draw_detections",
+                        lambda *args: pytest.fail("annotation was drawn"))
+    result = count_marked_areas(engine, str(image_path), [[2, 2, 18, 18]], str(tmp_path),
+                                "buttons", lambda proposal, width, height: proposal,
+                                annotate=False)
+    assert result["count"] == 1
+    assert result["detections"] == [{"index": 1, "box": [3, 3, 7, 7],
+                                     "confidence": None, "source": "quick"}]
+    assert (result["width"], result["height"]) == (40, 20)
+    assert "annotated_path" not in result
+    assert not list(tmp_path.glob("*.jpg"))
 
 
 def test_quick_merges_overlapping_areas_and_filters_size_outlier(tmp_path):

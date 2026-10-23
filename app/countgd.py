@@ -213,8 +213,7 @@ class CountGDEngine:
                     detections.append({"box": xyxy, "confidence": score})
                 predictions.append((tile, detections))
             raw_count = sum(len(detections) for _, detections in predictions)
-            detections = (merge_tile_detections(predictions, image.width, image.height)
-                          if len(tiles) > 1 else predictions[0][1])
+            detections = merge_tile_detections(predictions, image.width, image.height)
             detections.sort(key=lambda detection: (detection["box"][1], detection["box"][0]))
             for index, detection in enumerate(detections, start=1):
                 detection["index"] = index
@@ -226,11 +225,12 @@ class CountGDEngine:
                 warning += " Detection limit reached in an image or tile; the count may be low."
             outputs.append({
                 "count": len(detections), "detections": detections,
-                "annotated_path": str(destination) if destination is not None else None,
                 "width": image.width, "height": image.height,
                 "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
                 "warning": warning,
             })
+            if destination is not None:
+                outputs[-1]["annotated_path"] = str(destination)
             if len(tiles) > 1:
                 outputs[-1]["processing"] = {
                     "tiles": len(tiles), "tile_size": 800,

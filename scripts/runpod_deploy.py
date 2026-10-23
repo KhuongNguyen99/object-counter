@@ -132,20 +132,27 @@ def select_gpu(catalog, name):
 
 
 def endpoint_body(name, image, gpu, *, timeout_seconds=300, idle_seconds=30,
-                  disk_gb=30, env=None, flashboot="OFF"):
+                  disk_gb=30, env=None, flashboot="OFF", data_center_ids=None):
     if not image or not isinstance(image, str):
         raise ValueError("A published container image is required.")
     if not 1 <= timeout_seconds <= 1800 or not 1 <= idle_seconds <= 60 or not 1 <= disk_gb <= 100:
         raise ValueError("Timeout, idle timeout, or disk size exceeds the supported benchmark limits.")
     if flashboot not in {"OFF", "FLASHBOOT"}:
         raise ValueError("FlashBoot must be OFF or FLASHBOOT.")
-    return {"name": name, "image": image, "type": "QUEUE", "disk": disk_gb,
+    body = {"name": name, "image": image, "type": "QUEUE", "disk": disk_gb,
             "gpu": {"pools": [gpu["pool"]], "excludedTypes": gpu["excluded_types"], "count": 1,
                     "minCudaVersion": MIN_CUDA_VERSION},
             "workers": {"min": 0, "max": 1, "idleTimeout": idle_seconds},
             "scaling": {"type": "QUEUE_DELAY", "queueDelay": 1},
             "timeout": int(timeout_seconds * 1000), "flashboot": flashboot,
             "env": dict(env or {})}
+    if data_center_ids is not None:
+        if (not isinstance(data_center_ids, list) or not 1 <= len(data_center_ids) <= 50 or
+                any(not isinstance(value, str) or not ID.fullmatch(value) for value in data_center_ids) or
+                len(set(data_center_ids)) != len(data_center_ids)):
+            raise ValueError("Data centers must be distinct valid IDs.")
+        body["dataCenterIds"] = list(data_center_ids)
+    return body
 
 
 class OwnedEndpoints:
@@ -171,6 +178,8 @@ class OwnedEndpoints:
         # Never persist env values: a caller may use a credential in the worker environment.
         record = {"name": name, "image": image, "gpu": gpu, "id": None,
                   "state": "creating", "created_at": utc_now()}
+        if "dataCenterIds" in body:
+            record["data_center_ids"] = body["dataCenterIds"]
         self.data["resources"].append(record)
         self.save()
         try:
@@ -195,6 +204,8 @@ class OwnedEndpoints:
                 actual_gpu.get("minCudaVersion") != MIN_CUDA_VERSION or
                 sorted(actual_gpu.get("excludedTypes", [])) != sorted(expected_gpu["excludedTypes"])):
             raise ApiError("Created endpoint settings differ from the requested GPU and spending safeguards.")
+        if "dataCenterIds" in body and sorted(live.get("dataCenterIds") or []) != sorted(body["dataCenterIds"]):
+            raise ApiError("Created endpoint data centers differ from the requested locations.")
         return record
 
     def reconcile(self, record):
@@ -281,6 +292,8 @@ def main(argv=None):
     deploy = commands.add_parser("create", help="Create one scale-to-zero production endpoint")
     deploy.add_argument("--image", required=True)
     deploy.add_argument("--gpu", default="RTX A5000")
+    deploy.add_argument("--data-center", action="append", dest="data_center_ids",
+                        help="Restrict placement to this data center ID; repeat to allow several")
     deploy.add_argument("--manifest", required=True, type=Path)
     args = parser.parse_args(argv)
     try:
@@ -295,7 +308,8 @@ def main(argv=None):
             owned = OwnedEndpoints(api, args.manifest)
             try:
                 resource = owned.create(args.image, select_gpu(api.catalog(), args.gpu),
-                                        idle_seconds=5, flashboot="FLASHBOOT")
+                                        idle_seconds=5, flashboot="FLASHBOOT",
+                                        data_center_ids=args.data_center_ids)
             except BaseException:
                 owned.cleanup()
                 raise

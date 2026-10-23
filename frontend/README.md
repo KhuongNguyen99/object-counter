@@ -50,12 +50,12 @@ Shortcuts work throughout the example editor, including the photo and controls. 
 - Start counting: require examples on every queued photo, then count each full photo using its own examples. Search areas limit Find objects, not regular counting. Open the first photo missing examples and explain what is needed.
 - Quick count: offer a separate action for simple, separate, evenly spaced objects. Require 1 to 32 marked areas per photo and count suitable detections only inside them, using the same detector as Find objects. Examples and a prior Find objects step are unnecessary. Do not cap results at 10 or 32 objects.
 - Match strength: provide a regular-counting slider from 0.01 to 0.95, initially 0.80. Higher values keep closer matches. Save the choice locally across tab closures. It does not control Quick count or Find objects.
-- Progress: show waiting, counting, complete, and failed states; refresh automatically and disable conflicting actions during work.
+- Progress: show waiting, counting, complete, and failed states; wait for backend completion notifications and disable conflicting actions during work.
 - Summary: show total objects, the latest batch count or status, photos counted, and number of batches. Include each batch's date and status, and identify Quick count batches.
 
 ## 4. Review and correct
 
-- Photo results: show filename, count, annotated preview, review status, and warnings. Allow preview enlargement and Review photo.
+- Photo results: draw numbered boxes over the original photo from detection data. Show filename, count, review status, and warnings. Allow preview enlargement and Review photo. A small corner button composes and downloads a full-resolution annotated JPEG only when clicked.
 - Corrections: show the original photo with counted boxes. Provide Add box, Remove box, Move photo, zoom, and Undo. Update the displayed count while editing.
 - Save and confirm: Save changes stores a draft. Done reviewing saves, marks the photo reviewed, and closes the review. Saved corrections update photo, batch, and overall totals.
 - Protect edits: confirm before discarding unsaved changes. If another tab changes the result, preserve local edits, explain the conflict, and offer Reload latest.

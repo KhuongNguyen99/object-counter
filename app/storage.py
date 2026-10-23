@@ -256,7 +256,7 @@ class Store:
 
     @staticmethod
     def file_url(session_id, filename):
-        return f"/api/sessions/{session_id}/files/{filename}"
+        return f"/api/sessions/{session_id}/files/{filename}" if filename else None
 
     def owns_file(self, session_id, filename):
         with self.connection() as db:

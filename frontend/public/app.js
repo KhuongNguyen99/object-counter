@@ -29,7 +29,7 @@
     } catch { return null; }
   }
   const savedId = readStoredId();
-  const state = { models: [], device: "", refs: [], selected: 0, referenceEditing: true, targets: [], session: null, review: null, busy: false, detecting: null, polling: null, loadingModels: true, restoring: !!savedId };
+  const state = { models: [], device: "", refs: [], selected: 0, referenceEditing: true, targets: [], session: null, review: null, busy: false, detecting: null, polling: null, pollFailures: 0, loadingModels: true, restoring: !!savedId };
   const modelMode = (id) => state.models.find((model) => model.id === id)?.reference_mode || (["sam3", "countgd-plusplus"].includes(id) ? "per_image" : "shared");
   const referenceMode = () => state.session?.reference_mode || modelMode(state.session?.model || $("model-select").value);
   const perImageMode = () => referenceMode() === "per_image";
@@ -73,6 +73,39 @@
   function clearFiles(items) {
     for (const item of items) URL.revokeObjectURL(item.url);
     items.length = 0;
+  }
+
+  const localPhotos = new Map();
+  const pendingPhotos = new Map();
+  const photoUrl = (result) => localPhotos.get(result.id)?.url || apiUrl(result.original_url);
+
+  function clearLocalPhotos() {
+    for (const item of localPhotos.values()) URL.revokeObjectURL(item.url);
+    for (const items of pendingPhotos.values()) for (const item of items) URL.revokeObjectURL(item.url);
+    localPhotos.clear();
+    pendingPhotos.clear();
+  }
+
+  function useSession(next) {
+    if (state.session?.id && state.session.id !== next.id) clearLocalPhotos();
+    for (const batch of next.batches || []) {
+      const items = pendingPhotos.get(batch.id);
+      if (!items || batch.status !== "complete" && batch.status !== "failed") continue;
+      pendingPhotos.delete(batch.id);
+      batch.results?.forEach((result, index) => {
+        const item = items[index];
+        if (!item) return;
+        if (item.width === result.width && item.height === result.height) localPhotos.set(result.id, item);
+        else URL.revokeObjectURL(item.url);
+      });
+      for (const item of items.slice(batch.results?.length || 0)) URL.revokeObjectURL(item.url);
+    }
+    while (localPhotos.size > 40 || [...localPhotos.values()].reduce((bytes, item) => bytes + (item.file?.size || 0), 0) > 100 * 1024 * 1024) {
+      const [id, item] = localPhotos.entries().next().value;
+      localPhotos.delete(id);
+      URL.revokeObjectURL(item.url);
+    }
+    state.session = next;
   }
 
   function statusName(status) {
@@ -265,10 +298,10 @@
     if (supportedTypes.has(file.type)) {
       if (decoded.source.close) decoded.source.close();
       if (decoded.fallbackUrl) URL.revokeObjectURL(decoded.fallbackUrl);
-      return { file, url: URL.createObjectURL(file) };
+      return { file, url: URL.createObjectURL(file), width: decoded.width, height: decoded.height };
     }
     const normalized = await jpegFromDecoded(decoded, file.name);
-    return { file: normalized, url: URL.createObjectURL(normalized) };
+    return { file: normalized, url: URL.createObjectURL(normalized), width: decoded.width, height: decoded.height };
   }
 
   async function prepareExistingTargetsForPrompts() {
@@ -471,18 +504,17 @@
 
   function makeResult(result, countMode = "standard") {
     const card = node("div", "result-card");
+    const media = node("div", "result-media");
     const preview = node("button", "result-image");
     preview.type = "button";
     preview.setAttribute("aria-label", `Enlarge result for ${result.filename}`);
-    const image = node("img");
-    image.src = apiUrl(result.annotated_url || result.original_url);
-    image.alt = `Annotated count for ${result.filename}`;
-    preview.append(image, node("span", "preview-hint", "Enlarge"));
+    preview.append(ResultAnnotations.render(result, photoUrl(result)), node("span", "preview-hint", "Enlarge"));
     preview.addEventListener("click", () => {
       $("dialog-title").textContent = result.filename;
-      $("dialog-image").src = apiUrl(result.annotated_url || result.original_url);
+      $("dialog-visual").replaceChildren(ResultAnnotations.render(result, photoUrl(result)), downloadButton(result));
       $("image-dialog").showModal();
     });
+    media.append(preview, downloadButton(result));
     const body = node("div", "result-body");
     const line = node("div", "result-line");
     line.append(node("strong", "", result.filename), node("b", "", result.count === 0 ? "0 objects" : `${result.count} ${result.count === 1 ? "object" : "objects"}`));
@@ -500,8 +532,23 @@
       actions.append(button);
       body.append(actions);
     }
-    card.append(preview, body);
+    card.append(media, body);
     return card;
+  }
+
+  function downloadButton(result) {
+    const button = node("button", "image-download", "↓");
+    button.type = "button";
+    button.title = "Download annotated photo";
+    button.setAttribute("aria-label", `Download annotated photo for ${result.filename}`);
+    button.addEventListener("click", async () => {
+      if (button.disabled) return;
+      button.disabled = true;
+      try { await ResultAnnotations.download(result, photoUrl(result)); }
+      catch (error) { message(`Could not download this photo: ${error.message}`); }
+      finally { button.disabled = false; }
+    });
+    return button;
   }
 
   function renderSession() {
@@ -561,7 +608,7 @@
     const verification = result.verification;
     const secondaryAvailable = verification?.status === "complete" && Array.isArray(verification.secondary_detections);
     return { imageId: result.id, filename: result.filename, revision: result.review_revision || 0,
-      width: result.width, height: result.height, imageUrl: apiUrl(result.original_url),
+      width: result.width, height: result.height, imageUrl: photoUrl(result),
       boxes, savedBoxes: boxes.map((box) => [...box]),
       modelCount: result.model_count ?? result.count, reviewed: !!result.reviewed, clipped,
       secondaryAvailable, secondaryFailed: verification?.status === "failed", showSecondary: false,
@@ -759,10 +806,10 @@
     renderButtons();
     renderReview();
     try {
-      state.session = await request(`/api/sessions/${encodeURIComponent(sessionId)}/images/${encodeURIComponent(review.imageId)}/review`, {
+      useSession(await request(`/api/sessions/${encodeURIComponent(sessionId)}/images/${encodeURIComponent(review.imageId)}/review`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ revision: review.revision, boxes: review.boxes, reviewed }),
-      });
+      }));
       const saved = findResult(review.imageId);
       review.revision = saved.review_revision;
       review.reviewed = saved.reviewed;
@@ -773,7 +820,7 @@
       if (reviewed) { $("review-dialog").close(); state.review = null; }
     } catch (error) {
       if (error.status === 409) {
-        try { state.session = await request(`/api/sessions/${encodeURIComponent(sessionId)}`); }
+        try { useSession(await request(`/api/sessions/${encodeURIComponent(sessionId)}`)); }
         catch { /* Keep the unsaved boxes even if refresh fails. */ }
         review.stale = true;
         reviewMessage("This photo changed elsewhere. Your edits are still here; reload the latest version to continue.");
@@ -794,7 +841,7 @@
     state.busy = true;
     renderReview();
     try {
-      state.session = await request(`/api/sessions/${encodeURIComponent(sessionId)}`);
+      useSession(await request(`/api/sessions/${encodeURIComponent(sessionId)}`));
       const latest = findResult(review.imageId);
       if (!latest) throw new Error("Photo is no longer in this session");
       state.review = reviewFromResult(latest);
@@ -819,34 +866,46 @@
   }
 
   function stopPolling() {
-    if (state.polling) clearTimeout(state.polling);
+    if (state.polling?.timer) clearTimeout(state.polling.timer);
+    state.polling?.controller?.abort();
     state.polling = null;
   }
 
   function schedulePoll() {
     stopPolling();
-    if (hasPending() && !state.busy) state.polling = setTimeout(refreshSession, 500);
+    if (hasPending() && !state.busy) refreshSession(true);
   }
 
-  async function refreshSession() {
+  async function refreshSession(waitForChange = false) {
     if (!state.session || state.busy) return;
     const id = state.session.id;
+    const controller = waitForChange ? new AbortController() : null;
+    const pending = controller ? { controller } : null;
+    if (pending) state.polling = pending;
     try {
-      const updated = await request(`/api/sessions/${encodeURIComponent(id)}`);
-      if (state.busy || state.session?.id !== id) return;
-      state.session = updated;
+      const path = `/api/sessions/${encodeURIComponent(id)}`;
+      const query = waitForChange && state.session.revision ? `?after=${encodeURIComponent(state.session.revision)}&wait=25` : "";
+      const updated = await request(path + query, controller ? { signal: controller.signal } : undefined);
+      if (state.busy || state.session?.id !== id || pending && state.polling !== pending) return;
+      if (pending) state.polling = null;
+      useSession(updated);
+      state.pollFailures = 0;
       message("");
       render();
       schedulePoll();
     } catch (error) {
+      if (pending && state.polling !== pending || error.name === "AbortError" || state.session?.id !== id) return;
+      if (pending) state.polling = null;
       if (error.status === 404) {
+        clearLocalPhotos();
         forgetId();
         state.session = null;
         message("That counting session is no longer available. Start a new count.");
         render();
       } else {
         message(`Could not refresh results: ${error.message} Retrying automatically.`);
-        state.polling = setTimeout(refreshSession, 2500);
+        const delay = Math.min(30_000, 2500 * 2 ** Math.min(state.pollFailures++, 4));
+        state.polling = { timer: setTimeout(() => refreshSession(true), delay) };
       }
     }
   }
@@ -868,8 +927,8 @@
     renderButtons();
     message("");
     try {
-      await request(`/api/sessions/${encodeURIComponent(state.session.id)}/batches`, { method: "POST", body: form });
-      clearFiles(state.targets);
+      const accepted = await request(`/api/sessions/${encodeURIComponent(state.session.id)}/batches`, { method: "POST", body: form });
+      pendingPhotos.set(accepted.id, state.targets.splice(0));
       state.busy = false;
       await refreshSession();
     } catch (error) {
@@ -877,8 +936,9 @@
       if (!error.status) {
         try {
           const updated = await request(`/api/sessions/${encodeURIComponent(state.session.id)}`);
-          state.session = updated;
+          useSession(updated);
           if ((updated.batches?.length || 0) > previousBatchCount) {
+            // The new batch may belong to another tab, so its image IDs cannot identify these local files.
             clearFiles(state.targets);
             message("Your batch was received. Counting is in progress.", true);
             render();
@@ -953,7 +1013,7 @@
     render();
     message("");
     try {
-      state.session = await request("/api/sessions", { method: "POST", body: form });
+      useSession(await request("/api/sessions", { method: "POST", body: form }));
       storeId(state.session.id);
       if (!perImage) clearFiles(state.refs);
       state.busy = false;
@@ -974,12 +1034,12 @@
     stopPolling();
     renderButtons();
     try {
-      state.session = await request(`/api/sessions/${encodeURIComponent(state.session.id)}/finish`, { method: "POST" });
+      useSession(await request(`/api/sessions/${encodeURIComponent(state.session.id)}/finish`, { method: "POST" }));
       clearFiles(state.targets);
       message("Count finished.", true);
     } catch (error) {
       try {
-        state.session = await request(`/api/sessions/${encodeURIComponent(state.session.id)}`);
+        useSession(await request(`/api/sessions/${encodeURIComponent(state.session.id)}`));
       } catch { /* A later retry safely reconciles an interrupted finish request. */ }
       if (state.session.status === "finished") message("Count finished.", true);
       else message(`Could not finish counting: ${error.message} Try again.`);
@@ -993,6 +1053,7 @@
     stopPolling();
     clearFiles(state.targets);
     clearFiles(state.refs);
+    clearLocalPhotos();
     state.session = null;
     state.selected = 0;
     state.referenceEditing = true;
@@ -1136,7 +1197,7 @@
   if (savedId) {
     message("Restoring your previous count…", true);
     request(`/api/sessions/${encodeURIComponent(savedId)}`).then((session) => {
-      state.session = session;
+      useSession(session);
       state.restoring = false;
       message("");
       render();

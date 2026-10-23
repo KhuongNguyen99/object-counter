@@ -197,7 +197,14 @@ def main() -> None:
     _startup_metrics["worker_ready_ms"] = round((time.perf_counter() - started) * 1000, 2)
     import runpod
 
-    runpod.serverless.start({"handler": handler})
+    sdk_handler = handler
+    if os.environ.get("RUNPOD_TRACE_TIMING") == "1":
+        from runpod.serverless.modules import rp_http, rp_job
+
+        from app.runpod_observability import install
+
+        sdk_handler = install(handler, rp_job, rp_http)
+    runpod.serverless.start({"handler": sdk_handler})
 
 
 if __name__ == "__main__":

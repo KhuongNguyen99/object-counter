@@ -43,14 +43,13 @@ def test_runpod_backend_routes_catalog_suggestions_and_count(tmp_path, monkeypat
                     "model": "fastsam-s", "elapsed_ms": 1.5, "warning": None}
 
         def count(self, model_id, references, image_paths, output_dir, confidence, label,
-                  reference_mode):
+                  reference_mode, annotate=True):
             self.count_calls.append((model_id, references, image_paths, reference_mode))
             assert references[0]["path"] == image_paths[0]
-            annotation = Path(output_dir) / "annotation.jpg"
-            Image.open(image_paths[0]).save(annotation)
+            assert annotate is False
             return [{"count": 1, "detections": [{"index": 1, "box": [1, 1, 8, 8],
                                                    "confidence": .9}],
-                     "annotated_path": str(annotation), "width": 16, "height": 12,
+                     "width": 16, "height": 12,
                      "elapsed_ms": 2.5, "warning": None}]
 
     monkeypatch.setattr(runpod_client, "RunPodInferenceEngine", FakeRemoteEngine)

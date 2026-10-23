@@ -120,6 +120,31 @@ def test_exact_gpu_selection_excludes_every_other_card_in_pool():
     assert normalize_gpu("NVIDIA L4") == normalize_gpu("L4")
 
 
+def test_data_center_restriction_is_persisted_and_verified(tmp_path):
+    api = FakeApi()
+    owned = OwnedEndpoints(api, tmp_path / "resources.json")
+    record = owned.create("worker:v1", select_gpu(CATALOG, "RTX A5000"),
+                          data_center_ids=["US-IL-1"])
+    assert api.live[record["id"]]["dataCenterIds"] == ["US-IL-1"]
+    assert record["data_center_ids"] == ["US-IL-1"]
+    api.live[record["id"]]["dataCenterIds"] = ["CA-MTL-1"]
+    request = api.request
+
+    def wrong_location(method, path, data=None, **kwargs):
+        value = request(method, path, data, **kwargs)
+        return {**value, "dataCenterIds": ["CA-MTL-1"]} if method == "GET" else value
+
+    api.request = wrong_location
+    with pytest.raises(ApiError, match="data centers"):
+        owned.create("worker:v2", select_gpu(CATALOG, "RTX A5000"), data_center_ids=["US-IL-1"])
+
+
+@pytest.mark.parametrize("locations", [[], "US-IL-1", ["US-IL-1", "US-IL-1"], ["../other"], [None]])
+def test_invalid_data_centers_are_rejected_before_creation(locations):
+    with pytest.raises(ValueError, match="Data centers"):
+        endpoint_body("test", "worker:v1", select_gpu(CATALOG, "RTX A5000"), data_center_ids=locations)
+
+
 @pytest.mark.parametrize("catalog,name", [
     (CATALOG, "A5000"),
     (CATALOG + [CATALOG[0]], "RTX A5000"),

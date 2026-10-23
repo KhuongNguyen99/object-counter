@@ -6,10 +6,11 @@ import vm from "node:vm";
 // Exercise the actual browser handlers with deferred network responses, without a browser dependency.
 const source = readFileSync(new URL("../frontend/public/app.js", import.meta.url), "utf8").replace(
   /\}\)\(\);\s*$/,
-  "globalThis.testApp = { state, render, addReferences, addTargets, uploadBatch, finishCount, referenceReview, apiUrl };})();",
+  "globalThis.testApp = { state, render, addReferences, addTargets, uploadBatch, finishCount, newCount, refreshSession, schedulePoll, stopPolling, useSession, localPhotos, pendingPhotos, referenceReview, apiUrl };})();",
 );
 const referenceEditorSource = readFileSync(new URL("../frontend/public/reference-review.js", import.meta.url), "utf8");
 const selectionSource = readFileSync(new URL("../frontend/public/reference-selection.js", import.meta.url), "utf8");
+const annotationSource = readFileSync(new URL("../frontend/public/result-annotations.js", import.meta.url), "utf8");
 
 class Element {
   constructor(tag = "div") {
@@ -38,7 +39,7 @@ class Element {
   reset() {}
   focus() { this.focused = true; }
   querySelector(selector) {
-    const matches = (element) => selector === "img" ? element.tag === "img" :
+    const matches = (element) => ["img", "image"].includes(selector) ? element.tag === selector :
       selector === '[aria-current="true"]' && element["aria-current"] === "true";
     const find = (element) => {
       for (const child of element.children) {
@@ -68,7 +69,7 @@ const confidenceCatalog = {
   default_model: "countgd-plusplus", device: "cpu",
 };
 const session = (status = "active") => ({
-  id: "saved-session", label: "Apples", model: "yoloe-26s-seg", status,
+  id: "saved-session", label: "Apples", model: "yoloe-26s-seg", status, revision: "revision-1",
   created_at: "2026-10-17T12:00:00Z", total_count: 0, image_count: 0,
   references: [], batches: [],
 });
@@ -122,6 +123,7 @@ function browser(fetch, savedId = null, modelCatalog = catalog, storage = new Ma
       removeItem(key) { storage.delete(key); },
     },
     URL: BrowserURL,
+    AbortController,
     createImageBitmap: async (file) => { decoded.push(file); return { width: file.width, height: file.height, close() {} }; },
     File: class {
       constructor(parts, name, options) {
@@ -136,13 +138,14 @@ function browser(fetch, savedId = null, modelCatalog = catalog, storage = new Ma
     Option: class extends Element {
       constructor(label, value) { super("option"); this.textContent = label; this.value = value; }
     },
-    setTimeout: (callback) => { const id = nextTimer++; timers.set(id, callback); return id; },
+    setTimeout: (callback, delay) => { const id = nextTimer++; callback.retryDelay = delay; timers.set(id, callback); return id; },
     clearTimeout: (id) => timers.delete(id),
     window: { scrollTo() {} },
   };
   vm.createContext(context);
   vm.runInContext(selectionSource, context, { filename: "reference-selection.js" });
   vm.runInContext(referenceEditorSource, context, { filename: "reference-review.js" });
+  vm.runInContext(annotationSource, context, { filename: "result-annotations.js" });
   vm.runInContext(source, context, { filename: "app.js" });
   return { ...context.testApp, get: document.getElementById, timers, revoked, decoded, canvases };
 }
@@ -196,9 +199,14 @@ test("a lost finish response reconciles the committed session and exposes New co
   assert.equal(app.state.busy, false);
 });
 
-test("restoring a saved session keeps setup locked and resumes polling a pending batch", async () => {
+test("restoring a saved session keeps setup locked and opens a completion wait", async () => {
   const restored = deferred();
-  const app = browser(() => restored.promise, "saved-session");
+  const waiting = deferred();
+  let waitRequest;
+  const app = browser((path, options) => {
+    if (options?.signal) { waitRequest = [path, options]; return waiting.promise; }
+    return restored.promise;
+  }, "saved-session");
   await settle();
   assert.equal(app.state.restoring, true);
   assert.equal(app.get("setup-view").hidden, true);
@@ -214,7 +222,110 @@ test("restoring a saved session keeps setup locked and resumes polling a pending
   assert.equal(app.get("session-view").hidden, false);
   assert.equal(app.get("upload-button").disabled, true);
   assert.equal(app.get("finish-button").disabled, true);
-  assert.equal(app.timers.size, 1, "pending results must resume automatic polling");
+  assert.match(waitRequest[0], /after=.*&wait=25$/, "pending results must wait for a revision change");
+  assert.equal(app.timers.size, 0, "waiting needs no short timer");
+});
+
+test("completion wait aborts on stop, ignores stale replies, and accepts the next revision", async () => {
+  const first = deferred();
+  const second = deferred();
+  const waits = [];
+  const app = browser((path, options) => {
+    waits.push([path, options]);
+    return waits.length === 1 ? first.promise : second.promise;
+  });
+  await settle();
+  const running = session();
+  running.batches = [{ id: "batch-1", status: "running", results: [] }];
+  app.state.session = running;
+  app.schedulePoll();
+  assert.match(waits[0][0], /\?after=revision-1&wait=25$/);
+  assert.equal(waits[0][1].signal.aborted, false);
+  app.stopPolling();
+  assert.equal(waits[0][1].signal.aborted, true);
+  first.resolve(response({ ...running, revision: "stale", batches: [] }));
+  await settle();
+  assert.equal(app.state.session.revision, "revision-1");
+  app.schedulePoll();
+  second.resolve(response({ ...running, revision: "revision-2", batches: [{ id: "batch-1", status: "complete", results: [] }] }));
+  await settle();
+  assert.equal(app.state.session.revision, "revision-2");
+  assert.equal(app.timers.size, 0);
+});
+
+test("completion wait retries transient errors with bounded backoff", async () => {
+  let reads = 0;
+  const app = browser(() => { reads++; throw new TypeError("Network unavailable"); });
+  await settle();
+  const running = session();
+  running.batches = [{ id: "batch-1", status: "running", results: [] }];
+  app.state.session = running;
+  app.schedulePoll();
+  await settle();
+  assert.equal(reads, 1);
+  assert.equal(app.timers.size, 1);
+  const [[timer, retry]] = [...app.timers];
+  assert.equal(timer, 1);
+  assert.equal(retry.retryDelay, 2500);
+  app.timers.delete(timer);
+  retry();
+  await settle();
+  assert.equal(reads, 2);
+  assert.equal(app.timers.size, 1);
+  assert.equal([...app.timers.values()][0].retryDelay, 5000);
+  assert.match(app.get("notice").textContent, /Retrying automatically/);
+  app.stopPolling();
+  assert.equal(app.timers.size, 0);
+});
+
+test("a completed batch reuses its local photo by image ID until the count resets", async () => {
+  const waiting = deferred();
+  const running = session();
+  running.batches = [{ id: "batch-1", status: "running", results: [] }];
+  const app = browser((path, options) => {
+    if (path.endsWith("/batches")) return response({ id: "batch-1", status: "queued" }, 202);
+    if (options?.signal) return waiting.promise;
+    return response(running);
+  });
+  await settle();
+  app.state.session = session();
+  app.state.targets.push({ file: { name: "apple.jpg" }, url: "blob:apple", width: 100, height: 80 });
+  await app.uploadBatch();
+  assert.equal(app.pendingPhotos.get("batch-1")[0].url, "blob:apple");
+  assert.equal(app.revoked.includes("blob:apple"), false);
+  const complete = { ...running, revision: "revision-2", image_count: 1, total_count: 1,
+    batches: [{ id: "batch-1", status: "complete", total_count: 1, results: [{
+      id: "image-1", filename: "apple.jpg", count: 1, width: 100, height: 80,
+      original_url: "/original.jpg", annotated_url: null, detections: [{ box: [1, 2, 20, 30] }],
+    }] }] };
+  waiting.resolve(response(complete));
+  await settle();
+  assert.equal(app.localPhotos.get("image-1").url, "blob:apple");
+  assert.equal(app.get("batch-list").querySelector("image").href, "blob:apple");
+  app.useSession({ ...complete, status: "finished" });
+  app.newCount();
+  assert.equal(app.localPhotos.size, 0);
+  assert.equal(app.revoked.filter((url) => url === "blob:apple").length, 1);
+});
+
+test("an uncertain upload reply never pairs another tab's result with this tab's photo", async () => {
+  const updated = { ...session(), image_count: 1, total_count: 1,
+    batches: [{ id: "other-tab-batch", status: "complete", total_count: 1, results: [{
+      id: "other-image", filename: "apple.jpg", count: 1, width: 100, height: 80,
+      original_url: "/other-original.jpg", detections: [{ box: [1, 2, 20, 30] }],
+    }] }] };
+  const app = browser((path) => {
+    if (path.endsWith("/batches")) throw new TypeError("Connection lost");
+    return response(updated);
+  });
+  await settle();
+  app.state.session = session();
+  app.state.targets.push({ file: { name: "apple.jpg" }, url: "blob:this-tab", width: 100, height: 80 });
+  await app.uploadBatch();
+  assert.equal(app.localPhotos.size, 0);
+  assert.equal(app.pendingPhotos.size, 0);
+  assert.equal(app.revoked.filter((url) => url === "blob:this-tab").length, 1);
+  assert.equal(app.get("batch-list").querySelector("image").href, "/other-original.jpg");
 });
 
 test("a configured backend prefixes requests, result photos, export, and resumed polling", async () => {
@@ -244,9 +355,9 @@ test("a configured backend prefixes requests, result photos, export, and resumed
   await app.get("start-button").listeners.click();
   assert.ok(calls.some(([url, method]) => url === `${prefix}/api/sessions` && method === "POST"));
   assert.equal(storage.get(`countwell.sessionId.${encodeURIComponent(prefix)}`), "saved-session");
-  assert.equal(app.get("batch-list").querySelector("img").src, `${prefix}/images/annotated.jpg`);
-  app.get("batch-list").children[0].children[1].children[0].listeners.click();
-  assert.equal(app.get("dialog-image").src, `${prefix}/images/annotated.jpg`);
+  assert.equal(app.get("batch-list").querySelector("image").href, `${prefix}/images/original.jpg`);
+  app.get("batch-list").children[0].children[1].children[0].children[0].listeners.click();
+  assert.equal(app.get("dialog-visual").querySelector("image").href, `${prefix}/images/original.jpg`);
   assert.equal(app.get("export-link").href, `${prefix}/api/sessions/saved-session/export.csv`);
   app.state.targets.push({ file: { name: "another.jpg" }, url: "blob:upload" });
   app.render();
@@ -262,7 +373,7 @@ test("a configured backend prefixes requests, result photos, export, and resumed
   await settle();
   assert.equal(restored.state.session.id, "saved-session");
   assert.ok(calls.some(([url, method]) => url === `${prefix}/api/sessions/saved-session` && method === "RESTORE"));
-  assert.equal(restored.get("batch-list").querySelector("img").src, `${prefix}/images/annotated.jpg`);
+  assert.equal(restored.get("batch-list").querySelector("image").href, `${prefix}/images/original.jpg`);
 });
 
 test("an invalid backend address leaves counting unavailable with a plain-language message", async () => {
@@ -750,7 +861,7 @@ test("SAM3 submits only selected boxes in image order and keeps the editor usabl
   assert.deepEqual(batches[0].filter(([key]) => key === "images").map(([, file]) => file.name), ["one.jpg", "two.jpg"]);
   assert.equal(batches[0].find(([key]) => key === "image_boxes")[1], "[[[1,2,20,30]],[[40,10,70,60]]]");
   assert.equal(app.state.targets.length, 0);
-  assert.ok(uploadedUrls.every((url) => app.revoked.filter((item) => item === url).length === 1));
+  assert.ok(uploadedUrls.every((url) => !app.revoked.includes(url)), "submitted photos remain local while results are pending");
   assert.equal(app.get("reference-panel").hidden, true, "empty photo selection is hidden between batches");
   assert.ok(app.get("session-reference-slot").children.includes(app.get("reference-panel")));
   await app.addTargets([referenceFile("three.png")]);

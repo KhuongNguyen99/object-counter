@@ -19,7 +19,7 @@ from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from PIL import Image, ImageOps, UnidentifiedImageError
@@ -285,6 +285,21 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None, frontend_o
     slots = threading.BoundedSemaphore(MAX_QUEUE)
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="counting")
     engine = None
+    waiters = {}
+    waiters_lock = threading.Lock()
+
+    def wake_waiter(future):
+        if not future.done():
+            future.set_result(None)
+
+    def notify_session(session_id):
+        with waiters_lock:
+            pending = list(waiters.get(session_id, ()))
+        for future in pending:
+            try:
+                future.get_loop().call_soon_threadsafe(wake_waiter, future)
+            except RuntimeError:
+                pass  # A disconnected client's event loop may already be closed.
 
     detect_device = model_lister is None
     remote = backend == "runpod"
@@ -334,6 +349,8 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None, frontend_o
             result["reference_mode"] = entry.get(
                 "reference_mode", LEGACY_REFERENCE_MODES.get(result["model"], "shared"))
             result["required_reference_boxes"] = entry.get("required_reference_boxes")
+        result["revision"] = hashlib.sha256(json.dumps(
+            result, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
         return result
 
     def run_batch(session_id, batch_id, items, per_image, count_mode):
@@ -344,6 +361,7 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None, frontend_o
         created = []
         try:
             store.set_batch_status(batch_id, "running")
+            notify_session(session_id)
             output_dir.mkdir(parents=True, exist_ok=True)
             if engine is None:
                 engine = engine_factory()
@@ -351,7 +369,8 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None, frontend_o
             if count_mode == "quick":
                 output = [count_marked_areas(
                     engine, str(files_dir / item["original_filename"]), item["search_areas"],
-                    output_dir, session["label"], _validate_reference_proposal) for item in items]
+                    output_dir, session["label"], _validate_reference_proposal,
+                    annotate=False) for item in items]
             else:
                 if per_image:
                     references = [{"path": str(files_dir / item["original_filename"]),
@@ -361,6 +380,8 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None, frontend_o
                     references = [{"path": str(files_dir / ref["filename"]), "boxes": ref["boxes"]}
                                   for ref in refs]
                 options = {"reference_mode": "per_image"} if per_image and session["model"] == COUNTGD_MODEL_ID else {}
+                if options:
+                    options["annotate"] = False
                 output = engine.count(
                     model_id=session["model"], references=references,
                     image_paths=[str(files_dir / item["original_filename"]) for item in items],
@@ -379,20 +400,42 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None, frontend_o
                     raise ValueError("The model returned inconsistent detections")
                 processing = (_validate_processing(result["processing"])
                               if "processing" in result else None)
-                annotation = Path(result["annotated_path"]).resolve()
-                if not annotation.is_file() or not annotation.is_relative_to(output_dir.resolve()):
-                    raise ValueError("The model did not save an annotated image")
-                annotated_filename = f"annotated-{item['id']}.jpg"
-                with Image.open(annotation) as annotated:
-                    if annotated.width * annotated.height > MAX_PIXELS:
-                        raise ValueError("The model returned an oversized annotated image")
-                    ImageOps.exif_transpose(annotated).convert("RGB").save(
-                        files_dir / annotated_filename, format="JPEG", quality=95)
-                created.append(files_dir / annotated_filename)
-                width, height = int(result["width"]), int(result["height"])
-                elapsed_ms = float(result["elapsed_ms"])
-                if width < 1 or height < 1 or not math.isfinite(elapsed_ms) or elapsed_ms < 0:
+                width, height = result["width"], result["height"]
+                elapsed_ms = result["elapsed_ms"]
+                if (type(width) is not int or type(height) is not int or
+                        (width, height) != (item["width"], item["height"]) or
+                        isinstance(elapsed_ms, bool) or not isinstance(elapsed_ms, (int, float)) or
+                        not math.isfinite(elapsed_ms) or elapsed_ms < 0):
                     raise ValueError("The model returned invalid image dimensions or timing")
+                if count > 30000:
+                    raise ValueError("The model returned too many detections")
+                for index, detection in enumerate(detections, 1):
+                    if (not isinstance(detection, dict) or type(detection.get("index")) is not int or
+                            detection["index"] != index or not isinstance(detection.get("box"), list) or
+                            len(detection["box"]) != 4 or any(
+                                isinstance(n, bool) or not isinstance(n, (int, float)) or not math.isfinite(n)
+                                for n in detection["box"])):
+                        raise ValueError("The model returned invalid detections")
+                    x1, y1, x2, y2 = detection["box"]
+                    confidence = detection.get("confidence")
+                    valid_confidence = (confidence is None and count_mode == "quick") or (
+                        not isinstance(confidence, bool) and isinstance(confidence, (int, float)) and
+                        math.isfinite(confidence) and 0 <= confidence <= 1)
+                    if (not (0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height) or
+                            not valid_confidence):
+                        raise ValueError("The model returned invalid detections")
+                annotated_filename = None
+                if count_mode != "quick" and not (per_image and session["model"] == COUNTGD_MODEL_ID):
+                    annotation = Path(result["annotated_path"]).resolve()
+                    if not annotation.is_file() or not annotation.is_relative_to(output_dir.resolve()):
+                        raise ValueError("The model did not save an annotated image")
+                    annotated_filename = f"annotated-{item['id']}.jpg"
+                    with Image.open(annotation) as annotated:
+                        if annotated.width * annotated.height > MAX_PIXELS:
+                            raise ValueError("The model returned an oversized annotated image")
+                        ImageOps.exif_transpose(annotated).convert("RGB").save(
+                            files_dir / annotated_filename, format="JPEG", quality=95)
+                    created.append(files_dir / annotated_filename)
                 results.append({
                     "id": item["id"], "count": count, "detections": detections,
                     "annotated_filename": annotated_filename, "width": width,
@@ -402,9 +445,11 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None, frontend_o
                     "verification": result.get("verification"),
                 })
             store.complete_batch(batch_id, results)
+            notify_session(session_id)
         except Exception as exc:
             logger.exception("Batch %s failed", batch_id)
             store.set_batch_status(batch_id, "failed", f"Counting failed: {exc}"[:300])
+            notify_session(session_id)
             for path in created:
                 path.unlink(missing_ok=True)
             for item in items:
@@ -509,8 +554,37 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None, frontend_o
         return detail_or_404(session_id)
 
     @app.get("/api/sessions/{session_id}")
-    def get_session(session_id: str):
-        return detail_or_404(session_id)
+    async def get_session(session_id: str, after: str | None = Query(None, max_length=64),
+                          wait: float = Query(0, ge=0, le=30)):
+        if not after or not wait:
+            return await run_in_threadpool(detail_or_404, session_id)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + wait
+        while True:
+            future = loop.create_future()
+            # Register before reading so a completion between read and wait is not lost.
+            with waiters_lock:
+                waiters.setdefault(session_id, set()).add(future)
+            try:
+                result = await run_in_threadpool(detail_or_404, session_id)
+                if (result["revision"] != after or not any(
+                        batch["status"] in {"queued", "running"} for batch in result["batches"])):
+                    return result
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return result
+                try:
+                    await asyncio.wait_for(future, remaining)
+                except TimeoutError:
+                    return await run_in_threadpool(detail_or_404, session_id)
+            finally:
+                future.cancel()
+                with waiters_lock:
+                    pending = waiters.get(session_id)
+                    if pending is not None:
+                        pending.discard(future)
+                        if not pending:
+                            del waiters[session_id]
 
     @app.post("/api/sessions/{session_id}/batches", status_code=202)
     async def create_batch(session_id: str, images: list[UploadFile] = File(...),
@@ -593,10 +667,12 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None, frontend_o
                               "busy": "This session already has a queued or running batch",
                               "duplicate": "Image already exists in this session"}[error]
                     raise HTTPException(status, detail)
+                notify_session(session_id)
                 try:
                     executor.submit(run_batch, session_id, batch_id, items, per_image, count_mode)
                 except Exception:
                     store.set_batch_status(batch_id, "failed", "Could not schedule counting. Please retry.")
+                    notify_session(session_id)
                     raise
             except Exception:
                 slots.release()
@@ -616,6 +692,7 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None, frontend_o
             raise HTTPException(409, "Wait for the current batch to finish")
         if error == "unreviewed":
             raise HTTPException(409, "Review and confirm every image before finishing this cross-check count")
+        notify_session(session_id)
         return detail_or_404(session_id)
 
     def save_image_review(session_id, image_id, payload):
@@ -643,12 +720,17 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None, frontend_o
                 if not (0 <= x1 < x2 <= item["width"] and 0 <= y1 < y2 <= item["height"]):
                     raise HTTPException(422, "Review boxes must have positive area and fit inside the image")
                 detections.append({"index": index, "box": box, "confidence": None, "source": "review"})
-            from .inference import _draw_detections, _read_image
             files_dir = data_dir / session_id / "files"
-            filename = f"reviewed-{image_id}-{uuid.uuid4().hex}.jpg"
-            destination = files_dir / filename
-            image = _read_image(str(files_dir / item["original_filename"]))
-            _draw_detections(image, detections, destination)
+            filename = None
+            if item["annotated_filename"]:
+                from .inference import _draw_detections, _read_image
+                filename = f"reviewed-{image_id}-{uuid.uuid4().hex}.jpg"
+                destination = files_dir / filename
+                image = _read_image(str(files_dir / item["original_filename"]))
+                try:
+                    _draw_detections(image, detections, destination)
+                finally:
+                    image.close()
             error = store.save_review(session_id, image_id, payload["revision"], detections,
                                       filename, payload["reviewed"])
             if error:
@@ -658,6 +740,7 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None, frontend_o
                     "stale": "This image was reviewed elsewhere. Reload the latest result before saving",
                 }[error])
             committed = True
+            notify_session(session_id)
             if item["review_annotated_filename"]:
                 try:
                     (files_dir / item["review_annotated_filename"]).unlink(missing_ok=True)

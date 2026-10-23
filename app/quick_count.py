@@ -63,8 +63,11 @@ def _filter_sizes(boxes):
             if abs(area - typical) <= tolerance + 1e-12]
 
 
-def count_marked_areas(engine, image_path, search_areas, output_dir, label, validate_proposal):
+def count_marked_areas(engine, image_path, search_areas, output_dir, label, validate_proposal, *,
+                       annotate=True):
     """Run the cached FastSAM helper on native-pixel crops and merge full-photo boxes."""
+    if not isinstance(annotate, bool):
+        raise ValueError("Annotate must be a boolean")
     started = time.perf_counter()
     image = _read_image(image_path)
     proposals = []
@@ -92,9 +95,12 @@ def count_marked_areas(engine, image_path, search_areas, output_dir, label, vali
         warnings.append("No objects found in the marked areas.")
     detections = [{"index": index, "box": box, "confidence": None, "source": "quick"}
                   for index, box in enumerate(boxes, 1)]
-    annotation = output_dir / f"annotation-{Path(image_path).stem}.jpg"
-    _draw_detections(image, detections, annotation)
-    return {"count": len(detections), "detections": detections,
-            "annotated_path": str(annotation), "width": image.width, "height": image.height,
-            "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
-            "warning": " ".join(dict.fromkeys(warnings)) or None}
+    result = {"count": len(detections), "detections": detections,
+              "width": image.width, "height": image.height,
+              "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
+              "warning": " ".join(dict.fromkeys(warnings)) or None}
+    if annotate:
+        annotation = output_dir / f"annotation-{Path(image_path).stem}.jpg"
+        _draw_detections(image, detections, annotation)
+        result["annotated_path"] = str(annotation)
+    return result
