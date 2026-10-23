@@ -121,21 +121,58 @@ def test_transient_status_retries_are_bounded(monkeypatch):
     failures = [HTTPError("https://api.runpod.ai/v2/endpoint-1/status/job-7", 503,
                           "top-secret-key provider detail", {}, BytesIO(b"secret"))
                 for _ in range(4)]
-    client, opener = _client([{"id": "job-7", "status": "IN_QUEUE"}, *failures])
+    client, opener = _client([{"id": "job-7", "status": "IN_QUEUE"}, *failures,
+                              {"id": "job-7", "status": "CANCELLED"}])
     monkeypatch.setattr(remote.time, "sleep", lambda seconds: None)
     with pytest.raises(remote.RunPodError, match="503") as exc:
         client.run({"action": "count"})
     assert "secret" not in str(exc.value)
-    assert [req.get_method() for req, _ in opener.calls] == ["POST", "GET", "GET", "GET", "GET"]
+    assert [req.get_method() for req, _ in opener.calls] == ["POST", "GET", "GET", "GET", "GET", "POST"]
+    assert opener.calls[-1][0].full_url.endswith("/cancel/job-7")
 
 
 def test_nontransient_status_error_is_not_retried():
     failure = HTTPError("https://api.runpod.ai/v2/endpoint-1/status/job-8", 401,
                         "top-secret-key provider detail", {}, BytesIO(b"secret"))
-    client, opener = _client([{"id": "job-8", "status": "IN_QUEUE"}, failure])
+    client, opener = _client([{"id": "job-8", "status": "IN_QUEUE"}, failure,
+                              {"id": "job-8", "status": "CANCELLED"}])
     with pytest.raises(remote.RunPodError, match="401"):
         client.run({"action": "count"})
-    assert [req.get_method() for req, _ in opener.calls] == ["POST", "GET"]
+    assert [req.get_method() for req, _ in opener.calls] == ["POST", "GET", "POST"]
+
+
+@pytest.mark.parametrize("bad_status", [
+    {"id": "job-9", "status": "UNKNOWN"},
+    {"id": "other-job", "status": "IN_PROGRESS"},
+])
+def test_invalid_status_cancels_job(bad_status):
+    client, opener = _client([{"id": "job-9", "status": "IN_QUEUE"}, bad_status,
+                              {"id": "job-9", "status": "CANCELLED"}])
+    with pytest.raises(remote.RunPodError):
+        client.run({"action": "count"})
+    assert [req.get_method() for req, _ in opener.calls] == ["POST", "GET", "POST"]
+    assert opener.calls[-1][0].full_url.endswith("/cancel/job-9")
+
+
+def test_interrupt_cancels_job_and_preserves_interrupt():
+    client, opener = _client([{"id": "job-10", "status": "IN_QUEUE"}, KeyboardInterrupt(),
+                              {"id": "job-10", "status": "CANCELLED"}])
+    with pytest.raises(KeyboardInterrupt):
+        client.run({"action": "count"})
+    assert [req.get_method() for req, _ in opener.calls] == ["POST", "GET", "POST"]
+
+
+def test_failed_cancel_does_not_mask_polling_failure():
+    status_error = HTTPError("https://api.runpod.ai/v2/endpoint-1/status/job-11", 401,
+                             "provider secret", {}, BytesIO(b"secret"))
+    cancel_error = HTTPError("https://api.runpod.ai/v2/endpoint-1/cancel/job-11", 503,
+                             "different provider secret", {}, BytesIO(b"secret"))
+    client, opener = _client([{"id": "job-11", "status": "IN_QUEUE"}, status_error,
+                              cancel_error])
+    with pytest.raises(remote.RunPodError, match="401") as exc:
+        client.run({"action": "count"})
+    assert "secret" not in str(exc.value)
+    assert [req.get_method() for req, _ in opener.calls] == ["POST", "GET", "POST"]
 
 
 def test_identity_metrics_reject_arbitrary_strings():
@@ -209,8 +246,6 @@ def test_adapter_count_preserves_image_bytes_and_draws_locally(tmp_path):
 @pytest.mark.parametrize("mutation", [
     lambda result: result.update(width=41),
     lambda result: result.update(count=2),
-    lambda result: result.update(count=2, detections=[result["detections"][0],
-                                                      {**result["detections"][0], "index": 2}]),
     lambda result: result["detections"][0].update(box=[0, 0, 41, 10]),
     lambda result: result["detections"][0].update(confidence=float("nan")),
     lambda result: result.update(annotated_path="/tmp/malicious.jpg"),
@@ -227,6 +262,24 @@ def test_adapter_rejects_bad_count_result_without_annotation(tmp_path, mutation)
         engine.count("countgd-plusplus", [{"path": source, "boxes": [[2, 3, 12, 15]]}],
                      [source], str(tmp_path / "out"), reference_mode="per_image")
     assert not list((tmp_path / "out").glob("*.jpg"))
+
+
+def test_adapter_preserves_count_when_edge_boxes_clip_to_same_coordinates(tmp_path):
+    source = _image(tmp_path / "input.png")
+    output = _count_output()
+    output["result"]["count"] = 2
+    output["result"]["detections"] = [
+        {"index": 1, "box": [0, 0, 2, 3], "confidence": .8},
+        {"index": 2, "box": [0, 0, 2, 3], "confidence": .7},
+    ]
+    client, _ = _client([{"id": "job-12", "status": "IN_QUEUE"},
+                         {"id": "job-12", "status": "COMPLETED", "output": output}])
+    engine = remote.RunPodInferenceEngine(client=client)
+    result = engine.count("countgd-plusplus", [{"path": source, "boxes": [[2, 3, 12, 15]]}],
+                          [source], str(tmp_path / "out"), reference_mode="per_image")[0]
+    assert result["count"] == 2
+    assert [item["index"] for item in result["detections"]] == [1, 2]
+    assert result["detections"][0]["box"] == result["detections"][1]["box"]
 
 
 def test_adapter_rejects_non_countgd_and_shared_before_network(tmp_path):

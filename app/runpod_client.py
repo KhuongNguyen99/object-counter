@@ -172,53 +172,49 @@ class RunPodClient:
     def wait(self, job_id, *, timeout_seconds=None):
         if not isinstance(job_id, str) or not _ID.fullmatch(job_id):
             raise ValueError("Invalid RunPod job ID.")
-        remaining = self.timeout_seconds if timeout_seconds is None else timeout_seconds
-        if not _number(remaining):
-            raise ValueError("RunPod wait timeout must be nonnegative.")
-        deadline = time.monotonic() + remaining
-        failures = 0
-        while True:
-            left = deadline - time.monotonic()
-            if left <= 0:
+        completed = False
+        try:
+            remaining = self.timeout_seconds if timeout_seconds is None else timeout_seconds
+            if not _number(remaining):
+                raise ValueError("RunPod wait timeout must be nonnegative.")
+            deadline = time.monotonic() + remaining
+            failures = 0
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise RunPodError("RunPod job timed out; cancellation was requested.")
+                try:
+                    data = self._request("GET", f"status/{job_id}", timeout=min(30, left))
+                except _TransientRunPodError:
+                    failures += 1
+                    if time.monotonic() >= deadline:
+                        raise RunPodError("RunPod job timed out; cancellation was requested.") from None
+                    if failures >= _MAX_STATUS_FAILURES:
+                        raise
+                    time.sleep(min(.5 * 2 ** (failures - 1), 4.0,
+                                   max(0, deadline - time.monotonic())))
+                    continue
+                failures = 0
+                if data.get("id") != job_id:
+                    raise RunPodError("RunPod returned an unexpected job ID.")
+                status = data.get("status")
+                if status == "COMPLETED":
+                    completed = True
+                    return data
+                if status in ("FAILED", "CANCELLED", "TIMED_OUT"):
+                    raise RunPodError(f"RunPod job ended with status {status}.")
+                if status not in ("IN_QUEUE", "IN_PROGRESS"):
+                    raise RunPodError("RunPod returned an unknown job status.")
+                time.sleep(min(1.0, max(0, deadline - time.monotonic())))
+        finally:
+            if not completed:
+                # The job may still be billable after a broken status response,
+                # network failure, or caller interruption. Keep the original
+                # exception if the best-effort cancellation also fails.
                 try:
                     self.cancel(job_id)
-                except RunPodError:
+                except BaseException:
                     pass
-                raise RunPodError("RunPod job timed out; cancellation was requested.")
-            try:
-                data = self._request("GET", f"status/{job_id}", timeout=min(30, left))
-            except _TransientRunPodError:
-                failures += 1
-                if time.monotonic() >= deadline:
-                    try:
-                        self.cancel(job_id)
-                    except RunPodError:
-                        pass
-                    raise RunPodError("RunPod job timed out; cancellation was requested.") from None
-                if failures >= _MAX_STATUS_FAILURES:
-                    raise
-                time.sleep(min(.5 * 2 ** (failures - 1), 4.0,
-                               max(0, deadline - time.monotonic())))
-                continue
-            except RunPodError:
-                if time.monotonic() >= deadline:
-                    try:
-                        self.cancel(job_id)
-                    except RunPodError:
-                        pass
-                    raise RunPodError("RunPod job timed out; cancellation was requested.") from None
-                raise
-            failures = 0
-            if data.get("id") != job_id:
-                raise RunPodError("RunPod returned an unexpected job ID.")
-            status = data.get("status")
-            if status == "COMPLETED":
-                return data
-            if status in ("FAILED", "CANCELLED", "TIMED_OUT"):
-                raise RunPodError(f"RunPod job ended with status {status}.")
-            if status not in ("IN_QUEUE", "IN_PROGRESS"):
-                raise RunPodError("RunPod returned an unknown job status.")
-            time.sleep(min(1.0, max(0, deadline - time.monotonic())))
 
     def run(self, job_input):
         """Submit and wait for one job; return the complete RunPod status response."""
@@ -373,8 +369,6 @@ class RunPodInferenceEngine:
                 raise RunPodError("RunPod worker returned an invalid detection.")
             checked.append({"index": index, "box": detection["box"],
                             "confidence": detection["confidence"]})
-        if len({tuple(detection["box"]) for detection in checked}) != count:
-            raise RunPodError("RunPod worker returned duplicate detections.")
         processing = result.get("processing")
         if processing is not None:
             limits = {"tiles": (1, 4096), "tile_size": (1, 16384),
