@@ -11,6 +11,8 @@ import subprocess
 import sys
 import uuid
 
+from app.environment import load_dotenv
+
 ROOT = Path(__file__).resolve().parent
 PROBE_IMAGE = "python:3.11-slim-bookworm"
 CUDA_CHECK = (
@@ -81,6 +83,19 @@ def service_url(service):
 def launch(args):
     if sys.version_info < (3, 11):
         raise RuntimeError("Install Python 3.11 or newer, then run this script again.")
+    env = os.environ.copy()
+    load_dotenv(ROOT / ".env", env)
+    backend = "local" if args.cpu or args.gpu else ("runpod" if args.runpod else
+              env.get("INFERENCE_BACKEND", "local").lower())
+    if backend not in {"local", "runpod"}:
+        raise ValueError("INFERENCE_BACKEND must be local or runpod.")
+    env["INFERENCE_BACKEND"] = backend
+    remote = backend == "runpod"
+    if remote:
+        from app.runpod_client import RunPodClient
+        RunPodClient(api_key=env.get("RUNPOD_API_KEY", ""),
+                     endpoint_id=env.get("RUNPOD_ENDPOINT_ID", ""),
+                     timeout_seconds=env.get("RUNPOD_TIMEOUT_SECONDS", "600"))
     if not shutil.which("docker"):
         raise RuntimeError("Docker was not found. Install Docker and its Compose plugin first.")
     version = docker("compose", "version", "--short", capture=True, timeout=30).stdout.strip()
@@ -90,15 +105,18 @@ def launch(args):
     if docker("info", "--format", "{{.OSType}}", capture=True, timeout=30).stdout.strip() != "linux":
         raise RuntimeError("Switch Docker to Linux containers, then run this script again.")
 
-    use_gpu = not args.cpu and gpu_available()
+    use_gpu = not remote and not args.cpu and gpu_available()
     if args.gpu and not use_gpu:
         raise RuntimeError("Docker cannot access an NVIDIA GPU. Enable GPU access or run with --cpu.")
-    print("Using GPU." if use_gpu else "Using CPU (GPU is unavailable or --cpu was chosen).", flush=True)
-    env = os.environ.copy()
-    if not use_gpu:
+    print("Using RunPod Serverless." if remote else
+          ("Using GPU." if use_gpu else "Using CPU (GPU is unavailable or --cpu was chosen)."),
+          flush=True)
+    if not remote and not use_gpu:
         env["DEVICE"] = "cpu"
     compose = ["compose", "-f", "compose.yaml"]
-    if use_gpu:
+    if remote:
+        compose += ["-f", "compose.runpod.yaml"]
+    elif use_gpu:
         compose += ["-f", "compose.gpu.yaml"]
     config = json.loads(docker(*compose, "config", "--format", "json", capture=True,
                                env=env, timeout=30).stdout)
@@ -108,7 +126,8 @@ def launch(args):
                 raise RuntimeError("App images are missing. Run again without --no-build to build them.")
     else:
         print("Preparing the app. First-time downloads and builds can take a while...", flush=True)
-        prepare_assets()
+        if not remote:
+            prepare_assets()
         docker(*compose, "build", env=env)
     if use_gpu:
         print("Checking GPU counting support...", flush=True)
@@ -129,6 +148,7 @@ def main(argv=None):
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--cpu", action="store_true", help="Use the CPU instead of checking for a GPU")
     mode.add_argument("--gpu", action="store_true", help="Require a working NVIDIA GPU in Docker")
+    mode.add_argument("--runpod", action="store_true", help="Use the configured RunPod Serverless endpoint")
     parser.add_argument("--no-build", action="store_true", help="Start existing app images without building or preparing model assets")
     args = parser.parse_args(argv)
     try:

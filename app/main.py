@@ -275,6 +275,9 @@ def _parse_frontend_origins(value):
 
 
 def create_app(data_dir=None, engine_factory=None, model_lister=None, frontend_origins=None):
+    backend = os.environ.get("INFERENCE_BACKEND", "local").strip().lower()
+    if backend not in {"local", "runpod"}:
+        raise ValueError("INFERENCE_BACKEND must be local or runpod")
     allowed_origins = _parse_frontend_origins(
         os.environ.get("FRONTEND_ORIGINS", "") if frontend_origins is None else frontend_origins)
     data_dir = Path(data_dir or os.environ.get("DATA_DIR", "data")).resolve()
@@ -284,16 +287,25 @@ def create_app(data_dir=None, engine_factory=None, model_lister=None, frontend_o
     engine = None
 
     detect_device = model_lister is None
+    remote = backend == "runpod"
     if model_lister is None:
-        def model_lister():
-            from app.models import list_models
-            catalog = [entry for entry in list_models() if entry["id"] == COUNTGD_MODEL_ID]
-            return {"models": catalog, "default_model": COUNTGD_MODEL_ID}
+        if remote:
+            from app.runpod_client import remote_model_catalog
+            model_lister = remote_model_catalog
+        else:
+            def model_lister():
+                from app.models import list_models
+                catalog = [entry for entry in list_models() if entry["id"] == COUNTGD_MODEL_ID]
+                return {"models": catalog, "default_model": COUNTGD_MODEL_ID}
 
     if engine_factory is None:
-        def engine_factory():
-            from app.inference import InferenceEngine
-            return InferenceEngine()
+        if remote:
+            from app.runpod_client import RunPodInferenceEngine
+            engine_factory = RunPodInferenceEngine
+        else:
+            def engine_factory():
+                from app.inference import InferenceEngine
+                return InferenceEngine()
 
     @asynccontextmanager
     async def lifespan(_app):

@@ -2,7 +2,7 @@
 
 Countwell counts objects in photos using a browser frontend and a local model backend. [CountGD++](https://github.com/niki-amini-naieni/CountGDPlusPlus) uses selected examples from each photo; ten are recommended. [FastSAM-s](https://docs.ultralytics.com/models/fast-sam/) suggests boxes and powers Quick count within marked areas. Users can review results, correct counts, and export CSV.
 
-The frontend and backend run in separate containers. Nginx serves the UI and proxies API requests to FastAPI, which owns inference, counting jobs, and saved data. Inference runs locally without a cloud API or API key.
+The frontend and backend run in separate containers. Nginx serves the UI and proxies API requests to FastAPI, which owns inference, counting jobs, and saved data. Inference runs locally by default. An optional RunPod Serverless worker runs the models on a cloud GPU while the app and saved data stay local.
 
 ## Demos
 
@@ -41,6 +41,8 @@ The launcher builds and starts both services, using a GPU when available and CPU
 Open [localhost:8080](http://localhost:8080). Backend API docs are at [127.0.0.1:8082/docs](http://127.0.0.1:8082/docs).
 
 Stop the app with `docker compose stop`. Saved counts, photos, and results stay in the `counter-data` volume at `/app/data`. `docker compose down -v` deletes that data.
+
+To use a RunPod model worker instead of a local GPU, set the RunPod fields in `.env` and run `python run.py --runpod`. See [RunPod setup and GPU comparison](docs/runpod.md).
 
 ## Repository structure
 

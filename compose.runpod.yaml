@@ -1,0 +1,10 @@
+services:
+  counter:
+    build:
+      dockerfile: Dockerfile.api
+    image: countwell-api:runpod
+    environment:
+      INFERENCE_BACKEND: runpod
+      RUNPOD_API_KEY: "${RUNPOD_API_KEY:?Set RUNPOD_API_KEY in .env}"
+      RUNPOD_ENDPOINT_ID: "${RUNPOD_ENDPOINT_ID:?Set RUNPOD_ENDPOINT_ID in .env}"
+      RUNPOD_TIMEOUT_SECONDS: "${RUNPOD_TIMEOUT_SECONDS:-600}"

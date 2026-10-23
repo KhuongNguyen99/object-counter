@@ -22,8 +22,15 @@ CONFIG = {
 }
 
 
+@pytest.fixture(autouse=True)
+def isolate_dotenv(monkeypatch):
+    # Launcher tests must never read the private checkout's .env file.
+    monkeypatch.setattr(launcher, "load_dotenv", lambda path, environ: False)
+    monkeypatch.delenv("INFERENCE_BACKEND", raising=False)
+
+
 def install_fake_docker(monkeypatch, *, version="2.40.0", os_type="linux",
-                        failure=None, cuda_code=0):
+                        failure=None, cuda_code=0, config=CONFIG):
     calls = []
     monkeypatch.setattr(launcher.shutil, "which", lambda name: "docker" if name == "docker" else None)
 
@@ -36,7 +43,7 @@ def install_fake_docker(monkeypatch, *, version="2.40.0", os_type="linux",
         elif args[:1] == ("info",):
             stdout = os_type
         elif "config" in args:
-            stdout = json.dumps(CONFIG)
+            stdout = json.dumps(config)
         elif "-c" in args:
             return subprocess.CompletedProcess(["docker", *args], cuda_code)
         else:
@@ -112,6 +119,96 @@ def test_forced_cpu_skips_gpu_probe_and_overrides_stale_device(monkeypatch):
                for _, kwargs in compose_calls(calls, "config") +
                compose_calls(calls, "build") + compose_calls(calls, "up"))
     assert not [args for args, _ in calls if args[:1] == ("run",)]
+
+
+def test_runpod_mode_uses_dotenv_copy_and_lightweight_overlay(monkeypatch, capsys):
+    calls = install_fake_docker(monkeypatch)
+    secret = "private-test-key"
+    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
+    monkeypatch.delenv("RUNPOD_ENDPOINT_ID", raising=False)
+    monkeypatch.setattr(launcher, "load_dotenv", lambda path, env: env.update({
+        "INFERENCE_BACKEND": "runpod", "RUNPOD_API_KEY": secret,
+        "RUNPOD_ENDPOINT_ID": "endpoint-123",
+    }))
+    monkeypatch.setattr(launcher, "gpu_available", lambda: pytest.fail("GPU probe must be skipped"))
+    monkeypatch.setattr(launcher, "prepare_assets", lambda: pytest.fail("assets must be skipped"))
+    monkeypatch.setattr(launcher, "run_probe", lambda *args, **kwargs: pytest.fail("CUDA probe must be skipped"))
+
+    assert launcher.main([]) == 0
+    assert "RUNPOD_API_KEY" not in launcher.os.environ
+    assert all("compose.runpod.yaml" in args and "compose.gpu.yaml" not in args
+               for args, _ in compose_calls(calls, "config") +
+               compose_calls(calls, "build") + compose_calls(calls, "up"))
+    assert all(kwargs["env"]["RUNPOD_API_KEY"] == secret and
+               kwargs["env"]["INFERENCE_BACKEND"] == "runpod"
+               for _, kwargs in compose_calls(calls, "config") +
+               compose_calls(calls, "build") + compose_calls(calls, "up"))
+    captured = capsys.readouterr()
+    assert "RunPod Serverless" in captured.out
+    assert secret not in captured.out + captured.err
+
+
+def test_explicit_local_mode_overrides_dotenv_runpod(monkeypatch):
+    calls = install_fake_docker(monkeypatch)
+    monkeypatch.setattr(launcher, "load_dotenv", lambda path, env: env.update({
+        "INFERENCE_BACKEND": "runpod",
+    }))
+    monkeypatch.setattr(launcher, "gpu_available", lambda: pytest.fail("GPU probe must be skipped"))
+    monkeypatch.setattr(launcher, "prepare_assets", lambda: None)
+
+    assert launcher.main(["--cpu"]) == 0
+    assert all("compose.runpod.yaml" not in args and kwargs["env"]["INFERENCE_BACKEND"] == "local"
+               for args, kwargs in compose_calls(calls, "config") +
+               compose_calls(calls, "build") + compose_calls(calls, "up"))
+
+
+def test_explicit_gpu_overrides_dotenv_runpod(monkeypatch):
+    calls = install_fake_docker(monkeypatch)
+    monkeypatch.setattr(launcher, "load_dotenv", lambda path, env: env.update({
+        "INFERENCE_BACKEND": "runpod",
+    }))
+    monkeypatch.setattr(launcher, "gpu_available", lambda: True)
+    monkeypatch.setattr(launcher, "prepare_assets", lambda: None)
+
+    assert launcher.main(["--gpu"]) == 0
+    assert all("compose.gpu.yaml" in args and "compose.runpod.yaml" not in args and
+               kwargs["env"]["INFERENCE_BACKEND"] == "local"
+               for args, kwargs in compose_calls(calls, "config") +
+               compose_calls(calls, "build") + compose_calls(calls, "up"))
+
+
+def test_explicit_runpod_overrides_dotenv_local(monkeypatch):
+    calls = install_fake_docker(monkeypatch)
+    monkeypatch.setattr(launcher, "load_dotenv", lambda path, env: env.update({
+        "INFERENCE_BACKEND": "local", "RUNPOD_API_KEY": "test-key",
+        "RUNPOD_ENDPOINT_ID": "endpoint-123",
+    }))
+    monkeypatch.setattr(launcher, "gpu_available", lambda: pytest.fail("GPU probe must be skipped"))
+    monkeypatch.setattr(launcher, "prepare_assets", lambda: pytest.fail("assets must be skipped"))
+
+    assert launcher.main(["--runpod"]) == 0
+    assert all("compose.runpod.yaml" in args and kwargs["env"]["INFERENCE_BACKEND"] == "runpod"
+               for args, kwargs in compose_calls(calls, "config") +
+               compose_calls(calls, "build") + compose_calls(calls, "up"))
+
+
+def test_explicit_runpod_requires_credentials_without_exposing_key(monkeypatch, capsys):
+    calls = install_fake_docker(monkeypatch)
+    secret = "private-test-key"
+    monkeypatch.setattr(launcher, "load_dotenv", lambda path, env: env.update({
+        "RUNPOD_API_KEY": secret, "RUNPOD_ENDPOINT_ID": "bad endpoint",
+    }))
+    assert launcher.main(["--runpod"]) == 1
+    captured = capsys.readouterr()
+    assert "RUNPOD_ENDPOINT_ID" in captured.err
+    assert secret not in captured.out + captured.err
+    assert not compose_calls(calls, "config")
+
+
+def test_runpod_flag_is_mutually_exclusive_with_local_flags():
+    with pytest.raises(SystemExit) as exc:
+        launcher.main(["--runpod", "--gpu"])
+    assert exc.value.code == 2
 
 
 def test_detected_gpu_selects_overlay_and_checks_cuda(monkeypatch):
