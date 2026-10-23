@@ -109,4 +109,3 @@ def test_unknown_backend_is_rejected_even_with_injected_dependencies(tmp_path, m
     monkeypatch.setenv("INFERENCE_BACKEND", "other")
     with pytest.raises(ValueError, match="INFERENCE_BACKEND must be local or runpod"):
         create_app(tmp_path, engine_factory=lambda: object(), model_lister=lambda: [])
-
