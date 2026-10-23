@@ -122,6 +122,42 @@ def test_benchmark_runs_identical_requests_and_deletes_all_endpoints(tmp_path):
     assert "not finalized invoices" in (args.output_dir / "report.md").read_text()
 
 
+def test_single_gpu_trial_preserves_repeats_identity_budget_and_cleanup(tmp_path):
+    args, api, calls = arguments(tmp_path), FakeApi(), []
+    args.gpu = ["NVIDIA L4"]
+
+    class Client:
+        def __init__(self, key, endpoint_id, **kwargs):
+            self.index = 0
+
+        def run(self, payload):
+            calls.append(payload)
+            self.index += 1
+            return response("NVIDIA L4", cold=self.index == 1)
+
+    report = benchmark(args, api, Client)
+    assert report["status"] == "completed"
+    assert len(report["trials"]) == 1
+    assert report["trials"][0]["gpu"]["id"] == "NVIDIA L4"
+    assert report["trials"][0]["summary"]["fitting"]["warm_samples"] == 2
+    assert len(calls) == 3 and all(call == calls[0] for call in calls)
+    assert report["identity"]["build_revision"] == "a" * 40
+    expected = budget_preflight([select_gpu(CATALOG, "NVIDIA L4")], budget_usd=5,
+                                trial_seconds=60, disk_gb=30)
+    assert report["budget"] == expected
+    assert sum(method == "POST" for method, _, _ in api.calls) == 1
+    assert not api.live and not report["cleanup_errors"]
+
+
+@pytest.mark.parametrize("gpus", [[], ["L4", "NVIDIA L4"], ["RTX A5000", "L4", "RTX 4090"]])
+def test_invalid_gpu_selection_is_rejected_before_creating_resources(tmp_path, gpus):
+    args, api = arguments(tmp_path), FakeApi()
+    args.gpu = gpus
+    with pytest.raises(ValueError, match="one or two distinct GPUs"):
+        benchmark(args, api, None)
+    assert not api.calls
+
+
 @pytest.mark.parametrize("failure", [TimeoutError, KeyboardInterrupt])
 def test_failure_or_interrupt_deletes_owned_endpoint_and_preserves_report(tmp_path, failure):
     args, api = arguments(tmp_path), FakeApi()

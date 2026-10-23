@@ -36,6 +36,8 @@ The workflow builds the CUDA backend, bundles model assets, adds `Dockerfile.run
 ghcr.io/khuongnguyen99/object-counter-worker:<full-Git-SHA>
 ```
 
+Before publishing, the workflow verifies model hashes and file access as the nonroot worker user. For code-only patches, its optional `base_image` input can reuse an existing worker image pinned by digest; changes to dependencies, model assets, or upstream model source need a fresh base build.
+
 It uses the workflow's `GITHUB_TOKEN` with `packages: write`; a separate registry password is unnecessary. Ensure the GHCR package is public so RunPod can pull it without a registry credential. Get the immutable image digest from the Docker push log or:
 
 ```powershell
@@ -54,7 +56,7 @@ python scripts/runpod_benchmark.py --image ghcr.io/khuongnguyen99/object-counter
 
 The defaults select **RTX A5000** and **NVIDIA L4**, with three warm repeats after each case's first call. The tool queries current GPU pools and prices, excludes other cards, verifies the deployed settings and actual worker GPU, and verifies that warm repeats use the same worker. Only the endpoint's first request is a full cold start; later cases have their first-call timings reported separately.
 
-Each endpoint has one GPU, minimum zero workers, maximum one worker, a 30-second idle timeout, and a 300-second execution timeout. New endpoints require CUDA 12.8 or newer through `gpu.minCudaVersion`, matching the worker's PyTorch CUDA build; the setting is verified before jobs run. Trials are limited to 900 seconds per GPU. Before creating resources, the tool reserves the quoted full trial lifetime plus cleanup time and a 25% margin against the $5 budget. These are local safeguards, **not a provider-enforced account spending cap**. The first GPU must stop before the second runs.
+Each endpoint has one GPU, minimum zero workers, maximum one worker, a 30-second idle timeout, and a 300-second execution timeout. New endpoints require CUDA 12.8 or newer through `gpu.minCudaVersion`, matching the worker's PyTorch CUDA build; the setting is verified before jobs run. Trials are limited to 900 seconds per GPU. Before creating resources, the tool reserves the quoted full trial lifetime plus cleanup time and a 25% margin against the $5 budget. These are local safeguards, **not a provider-enforced account spending cap**. The default comparison runs GPUs in sequence. For independent trials, pass `--gpu "RTX A5000"` or `--gpu "NVIDIA L4"` once and use a different output directory for each run; the caller must keep their combined spending within the total budget. Fresh image downloads can take several minutes. Use `--job-seconds 1800 --trial-seconds 1800` when allowing a longer first startup.
 
 Reports and the ownership manifest are saved under the output directory:
 
@@ -63,6 +65,8 @@ Reports and the ownership manifest are saved under the output directory:
 - `resources.json`: only this run's endpoint creation intents and IDs, retained for cleanup recovery.
 
 Both endpoints are deleted on completion by default. `--keep-winner` retains at most one endpoint with verified zero active workers and minimum zero workers, selected by the lowest sum of warm median request times. It does not select by finalized cost. Copy its reported ID into `RUNPOD_ENDPOINT_ID` when ready to use it.
+
+To create a separate app endpoint after the comparison, run `python scripts/runpod_deploy.py create --image <image-at-digest> --gpu "RTX A5000" --manifest test-results/runpod-production/resources.json`. This uses zero minimum workers, one maximum worker, a five-second idle timeout, and standard FlashBoot. The comparison disables FlashBoot to measure full cold starts.
 
 ## Billing and cleanup
 
@@ -76,7 +80,7 @@ python scripts/runpod_benchmark.py --refresh-billing --output-dir test-results/r
 
 If an endpoint was retained, refresh its benchmark receipts **before sending production traffic**: later jobs on that endpoint would enter its billing totals. The billing API exposes no finalization flag, so observed receipts remain labeled accordingly.
 
-Normal failures and Ctrl-C trigger cleanup. After a network failure or a forcibly killed process, retry using the saved manifest:
+Normal failures trigger cleanup. After an interruption, network failure, or forcibly killed process, verify cleanup using the saved manifest:
 
 ```powershell
 python scripts/runpod_deploy.py cleanup --manifest test-results/runpod-benchmark/comparison/resources.json

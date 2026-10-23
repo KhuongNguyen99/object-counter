@@ -117,17 +117,19 @@ def select_gpu(catalog, name):
 
 
 def endpoint_body(name, image, gpu, *, timeout_seconds=300, idle_seconds=30,
-                  disk_gb=30, env=None):
+                  disk_gb=30, env=None, flashboot="OFF"):
     if not image or not isinstance(image, str):
         raise ValueError("A published container image is required.")
     if not 1 <= timeout_seconds <= 1800 or not 1 <= idle_seconds <= 60 or not 1 <= disk_gb <= 100:
         raise ValueError("Timeout, idle timeout, or disk size exceeds the supported benchmark limits.")
+    if flashboot not in {"OFF", "FLASHBOOT"}:
+        raise ValueError("FlashBoot must be OFF or FLASHBOOT.")
     return {"name": name, "image": image, "type": "QUEUE", "disk": disk_gb,
             "gpu": {"pools": [gpu["pool"]], "excludedTypes": gpu["excluded_types"], "count": 1,
                     "minCudaVersion": MIN_CUDA_VERSION},
             "workers": {"min": 0, "max": 1, "idleTimeout": idle_seconds},
             "scaling": {"type": "QUEUE_DELAY", "queueDelay": 1},
-            "timeout": int(timeout_seconds * 1000), "flashboot": "OFF",
+            "timeout": int(timeout_seconds * 1000), "flashboot": flashboot,
             "env": dict(env or {})}
 
 
@@ -173,6 +175,7 @@ class OwnedEndpoints:
         actual_gpu = live.get("gpu", {})
         if (live.get("image") != image or live.get("type") != "QUEUE" or
                 live.get("workers") != body["workers"] or live.get("timeout") != body["timeout"] or
+                live.get("flashboot") != body["flashboot"] or
                 actual_gpu.get("count") != 1 or actual_gpu.get("pools") != expected_gpu["pools"] or
                 actual_gpu.get("minCudaVersion") != MIN_CUDA_VERSION or
                 sorted(actual_gpu.get("excludedTypes", [])) != sorted(expected_gpu["excludedTypes"])):
@@ -276,7 +279,8 @@ def main(argv=None):
         else:
             owned = OwnedEndpoints(api, args.manifest)
             try:
-                resource = owned.create(args.image, select_gpu(api.catalog(), args.gpu), idle_seconds=5)
+                resource = owned.create(args.image, select_gpu(api.catalog(), args.gpu),
+                                        idle_seconds=5, flashboot="FLASHBOOT")
             except BaseException:
                 owned.cleanup()
                 raise

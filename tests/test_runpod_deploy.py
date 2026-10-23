@@ -181,3 +181,13 @@ def test_missing_or_changed_cuda_floor_rejects_created_endpoint(tmp_path, report
         owned.create("worker:v1", select_gpu(CATALOG, "L4"))
     assert not owned.cleanup()
     assert not api.live
+
+
+def test_production_flashboot_does_not_enable_always_on_workers():
+    body = endpoint_body("production", "worker:v1", select_gpu(CATALOG, "L4"),
+                         idle_seconds=5, flashboot="FLASHBOOT")
+    assert body["flashboot"] == "FLASHBOOT"
+    assert body["workers"] == {"min": 0, "max": 1, "idleTimeout": 5}
+    with pytest.raises(ValueError, match="FlashBoot"):
+        endpoint_body("production", "worker:v1", select_gpu(CATALOG, "L4"),
+                      flashboot="PRIORITY_FLASHBOOT")

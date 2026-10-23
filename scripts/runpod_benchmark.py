@@ -1,4 +1,7 @@
-"""Compare two exact RunPod GPUs with owned endpoints and auditable billing.
+"""Benchmark one or two exact RunPod GPUs with owned endpoints and auditable billing.
+
+Omit --gpu to compare RTX A5000 and NVIDIA L4, or pass --gpu once for an
+independent single-GPU trial. Each invocation has its own budget and manifest.
 
 Fixture JSON: {"cases": [{"id": "fitting-count", "action": "count",
 "image": "../fitting-debug/target-original.jpg", "boxes": [[1, 2, 30, 40]],
@@ -273,8 +276,8 @@ def benchmark(args, api, client_factory):
     cases = prepare_cases(args.fixture)
     catalog = api.catalog()
     gpus = [select_gpu(catalog, name) for name in args.gpu]
-    if len(gpus) != 2 or gpus[0]["id"] == gpus[1]["id"]:
-        raise ValueError("Select exactly two distinct GPUs.")
+    if not 1 <= len(gpus) <= 2 or len({gpu["id"] for gpu in gpus}) != len(gpus):
+        raise ValueError("Select one or two distinct GPUs.")
     budget = budget_preflight(gpus, budget_usd=args.budget_usd, trial_seconds=args.trial_seconds, disk_gb=args.disk_gb)
     output = args.output_dir.resolve()
     if (output / "resources.json").exists():
@@ -376,7 +379,7 @@ def main(argv=None):
     parser.add_argument("--image", help="Published worker container pinned by an immutable @sha256 digest")
     parser.add_argument("--expected-build-revision", help="Require this exact worker Git revision in every response")
     parser.add_argument("--fixture", type=Path)
-    parser.add_argument("--gpu", action="append", help="Repeat exactly twice; defaults RTX A5000 and NVIDIA L4")
+    parser.add_argument("--gpu", action="append", help="Select one GPU, or repeat twice for comparison; defaults RTX A5000 and NVIDIA L4")
     parser.add_argument("--budget-usd", type=float)
     parser.add_argument("--trial-seconds", type=int, default=900, help="Maximum active trial time per GPU")
     parser.add_argument("--job-seconds", type=int, default=300)
